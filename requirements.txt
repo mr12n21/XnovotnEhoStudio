@@ -1,0 +1,5 @@
+numpy>=1.26
+soundfile>=0.12
+PySide6>=6.6
+# volitelné – nejnižší latence, vyžaduje systémovou knihovnu PortAudio (sudo dnf install portaudio)
+sounddevice>=0.4
