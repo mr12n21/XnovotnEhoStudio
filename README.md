@@ -8,20 +8,62 @@ a zvuky se dají libovolně zapínat a vypínat. Hraní se nahrává a v **postp
 zpětně upravit, kdy který zvuk hrál. Všechno je v jednom okně: záložka **Mix** a záložka
 **Postprodukce**.
 
-## Spuštění
+## Instalace na Linux Mint (a Ubuntu)
+
+Návod počítá s tím, že nemáš nic nainstalované. Všechno se dělá v **Terminálu**
+(Menu → Terminál, nebo Ctrl+Alt+T). Příkazy kopíruj po jednom, vlož je do terminálu
+(Ctrl+Shift+V) a potvrď Enterem. Když se `sudo` zeptá na heslo, napiš heslo ke svému
+účtu. Při psaní se nezobrazuje, to je normální.
+
+**1. Nainstaluj Python, pip a potřebné knihovny** (stačí jednou):
 
 ```bash
-./run.sh
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git libportaudio2 libxcb-cursor0
 ```
 
-Při prvním spuštění se vytvoří `.venv` a nainstaluje se `numpy`, `soundfile`, `PySide6` a `sounddevice`.
+- `python3-venv` a `python3-pip` na Mintu ve výchozím stavu chybí, bez nich se aplikace nespustí,
+- `libportaudio2` zajistí zvuk s nejnižší latencí,
+- `libxcb-cursor0` potřebuje okno aplikace (Qt 6).
 
-**Zvuk:** aplikace funguje hned přes Qt Multimedia (latence ~60 ms). Pro nejnižší latenci
-nainstaluj PortAudio a aplikace ho použije automaticky:
+**2. Stáhni aplikaci:**
 
 ```bash
-sudo dnf install portaudio
+cd ~
+git clone https://github.com/mr12n21/XNovotnEhoStudio.git
+cd XNovotnEhoStudio
 ```
+
+Bez gitu to jde i přes prohlížeč: na GitHubu klikni na **Code → Download ZIP**, ZIP rozbal
+(pravé tlačítko → *Rozbalit sem*) a v terminálu přejdi do rozbalené složky, např.
+`cd ~/Stažené/XNovotnEhoStudio-main`.
+
+**3. Spusť:**
+
+```bash
+bash run.sh
+```
+
+První spuštění trvá pár minut: vytvoří se složka `.venv` a stáhne se `numpy`, `soundfile`,
+`PySide6` a `sounddevice` (několik set MB). Další spuštění jsou rychlá, stačí znovu:
+
+```bash
+cd ~/XNovotnEhoStudio
+bash run.sh
+```
+
+### Když něco nejde
+
+| Hláška | Řešení |
+|---|---|
+| `ensurepip is not available` nebo `No module named venv` | chybí `python3-venv`, zopakuj krok 1 |
+| `Could not load the Qt platform plugin "xcb"` | `sudo apt install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-keysyms1` |
+| `Permission denied` u `./run.sh` | spouštěj přes `bash run.sh` |
+| `Instalace závislostí selhala` | zkontroluj internet, smaž `.venv` (`rm -rf .venv`) a spusť znovu |
+| aplikace běží, ale není slyšet zvuk | zkontroluj, že máš v systému (ikona reproduktoru) vybraný správný výstup |
+
+**Zvuk:** aplikace funguje i bez PortAudia přes Qt Multimedia (latence ~60 ms). S PortAudiem
+(`libportaudio2`, na Fedoře `sudo dnf install portaudio`) použije automaticky nižší latenci.
 
 ## 1. Stahování (hlavní okno, vlevo)
 

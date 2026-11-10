@@ -9,7 +9,7 @@ EXPORT_DIR = HOME / "exports"
 SESSION_FILE = HOME / "session.json"
 
 SAMPLE_RATE = 44100
-MAX_SOUND_SECONDS = 120          # delší zvuky se při načtení oříznou
+MAX_SOUND_SECONDS = 300       # delší zvuky se při načtení oříznou
 BACKEND = os.environ.get("NSS_BACKEND", "auto")  # auto | sd | qt | null
 
 USER_AGENT = "NovotnehoSoundStudio/0.1 (personal loop mixer; python-urllib)"
