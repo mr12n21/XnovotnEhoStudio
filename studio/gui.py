@@ -1,96 +1,33 @@
-"""GUI – PySide6."""
+"""Hlavní (jediné) okno: transport nahoře, záložky Mix a Postprodukce."""
 from __future__ import annotations
 
 import json
-import random
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QPalette, QShortcut
+from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QProgressBar, QSpinBox, QSplitter, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from . import config, library, scraper
+from .arrangement import Recorder
 from .audio_out import create_output
-from .engine import BEATS_PER_BAR, LENGTH_OPTIONS, Engine, Track, length_label
+from .engine import BEATS_PER_BAR, LENGTH_OPTIONS, Engine
+from .gui_common import AudioService, dark_palette, mkbtn, mkslider, nofocus, set_checked, write_credits
+from .gui_mixer import MixerPanel
+from .gui_timeline import PostPanel
 from .library import Sound
 
 QUANTIZE = [("off", "Okamžitě"), ("beat", "Na dobu"), ("bar", "Na takt")]
-N_SCENES = 8
-
-STYLE = """
-QPushButton#track { text-align: left; padding: 3px 6px; background: #2a2d31;
-    border: 1px solid #3a3f45; border-radius: 3px; color: #cfd3d8; }
-QPushButton#track:hover { border-color: #6a7480; }
-QPushButton#track[st="on"]   { background: #1f8f45; color: white; border-color: #33c06a; }
-QPushButton#track[st="pend"] { background: #8a6a12; color: white; }
-QPushButton#track[st="off-pend"] { background: #5a3a12; color: white; }
-QPushButton#track[st="load"] { background: #1d4f8c; color: white; }
-QPushButton#mute:checked { background: #b33; color: white; }
-QPushButton#solo:checked { background: #c9a227; color: black; }
-QPushButton#rec:checked  { background: #c62828; color: white; font-weight: bold; }
-QPushButton#play:checked { background: #1f8f45; color: white; font-weight: bold; }
-QPushButton#scene { min-width: 34px; }
-QPushButton#scene[filled="1"] { border: 1px solid #4fa3ff; color: #9fd0ff; }
-QFrame#column { background: #1e2023; border: 1px solid #33373c; border-radius: 6px; }
-QLabel#colname { font-weight: bold; font-size: 14px; }
-QToolButton#len { min-width: 38px; }
-QToolButton#fit:checked { background: #7b3fc4; color: white; }
-"""
-
-
-def nofocus(w):
-    w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    return w
-
-
-def mkbtn(text, checkable=False, name=None, tip=None):
-    b = nofocus(QPushButton(text))
-    b.setCheckable(checkable)
-    if name:
-        b.setObjectName(name)
-    if tip:
-        b.setToolTip(tip)
-    return b
-
-
-def mkslider(value, maximum=150, width=None, tip=None):
-    s = nofocus(QSlider(Qt.Orientation.Horizontal))
-    s.setRange(0, maximum)
-    s.setValue(value)
-    if width:
-        s.setFixedWidth(width)
-    if tip:
-        s.setToolTip(tip)
-    return s
-
-
-def repolish(w):
-    w.style().unpolish(w)
-    w.style().polish(w)
-
-
-def write_credits(path: Path, sounds: list[Sound]):
-    lines = ["Použité zvuky (freesound.org). Licence CC-BY vyžadují uvedení autora.", ""]
-    for s in sorted(sounds, key=lambda s: (s.namespace, s.title.lower())):
-        lines.append(f"- \"{s.title}\" by {s.username or '?'} [{s.license or '?'}] {s.url}  ({s.namespace})")
-    path.write_text("\n".join(lines) + "\n", "utf-8")
-
-
-# ======================================================================= vlákna
-
-class Bridge(QObject):
-    loaded = Signal(str, object)
+TAB_MIX, TAB_POST = 0, 1
 
 
 class DownloadThread(QThread):
@@ -119,298 +56,34 @@ class DownloadThread(QThread):
             self.ns_done.emit(ns)
 
 
-# ======================================================================= mixer widgety
-
-class TrackRow(QWidget):
-    def __init__(self, main: "MainWindow", t: Track):
-        super().__init__()
-        self.main, self.t = main, t
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(3)
-
-        self.btn = mkbtn("", True, "track")
-        self.btn.setMinimumWidth(120)
-        self.btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn.clicked.connect(lambda on: main.toggle(self.t, on))
-        self.btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.btn.customContextMenuRequested.connect(self._menu)
-
-        self.len = nofocus(QToolButton())
-        self.len.setObjectName("len")
-        self.len.setToolTip("Délka smyčky v dobách (auto = zaokrouhlit nahoru, free = přirozená délka)")
-        self.len.clicked.connect(self._len_menu)
-
-        self.fit = nofocus(QToolButton())
-        self.fit.setObjectName("fit")
-        self.fit.setText("⇔")
-        self.fit.setCheckable(True)
-        self.fit.setToolTip("Napasovat zvuk přesně do tempa (přetáhne ho – mění výšku tónu)")
-        self.fit.toggled.connect(self._set_fit)
-
-        self.vol = mkslider(int(t.volume * 100), width=64, tip="Hlasitost zvuku")
-        self.vol.valueChanged.connect(lambda v: setattr(self.t, "volume", v / 100))
-
-        lay.addWidget(self.btn, 1)
-        lay.addWidget(self.len)
-        lay.addWidget(self.fit)
-        lay.addWidget(self.vol)
-        self.sync_controls()
-
-    def sync_controls(self):
-        t = self.t
-        self.vol.blockSignals(True)
-        self.vol.setValue(int(t.volume * 100))
-        self.vol.blockSignals(False)
-        self.fit.blockSignals(True)
-        self.fit.setChecked(t.fit)
-        self.fit.blockSignals(False)
-        self.refresh()
-
-    def refresh(self):
-        t = self.t
-        if t.loading:
-            st = "load"
-        elif t.pending is not None:
-            st = "pend" if t.pending[0] else "off-pend"
-        elif t.enabled:
-            st = "on"
-        else:
-            st = ""
-        self.btn.blockSignals(True)
-        self.btn.setChecked(t.on)
-        self.btn.blockSignals(False)
-        if self.btn.property("st") != st:
-            self.btn.setProperty("st", st)
-            repolish(self.btn)
-        fm = self.btn.fontMetrics()
-        title = t.sound.title
-        elided = fm.elidedText(title, Qt.TextElideMode.ElideRight, max(60, self.btn.width() - 14))
-        self.btn.setText(elided.replace("&", "&&"))
-        beats = self.main.engine.loop_beats(t)
-        if t.length == "auto" and beats is not None:
-            self.len.setText(f"a{length_label(beats)}")
-        else:
-            self.len.setText(length_label(t.length))
-        s = t.sound
-        info = [f"<b>{title}</b>", f"autor: {s.username or '?'}", f"licence: {s.license or '?'}"]
-        if t.buffer is not None:
-            info.append(f"délka: {len(t.buffer) / self.main.engine.sr:.2f} s")
-        elif s.duration:
-            info.append(f"délka: {s.duration:.2f} s")
-        if beats is not None:
-            info.append(f"smyčka: {length_label(beats)} dob")
-        if t.src_bpm:
-            info.append(f"tempo v názvu: {t.src_bpm:g} BPM")
-        info.append("<i>pravé tlačítko = další volby</i>")
-        self.btn.setToolTip("<br>".join(info))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self.refresh()
-
-    def _len_menu(self):
-        m = QMenu(self)
-        for opt in LENGTH_OPTIONS:
-            a = m.addAction(length_label(opt) + ("" if opt in ("auto", "free") else " dob"))
-            a.setCheckable(True)
-            a.setChecked(opt == self.t.length)
-            a.triggered.connect(lambda _=False, o=opt: self._set_len(o))
-        m.exec(self.len.mapToGlobal(self.len.rect().bottomLeft()))
-
-    def _set_len(self, opt):
-        self.t.length = opt
-        self.main.engine.prepare(self.t)
-        self.refresh()
-
-    def _set_fit(self, on):
-        self.t.fit = on
-        self.main.engine.prepare(self.t)
-        self.refresh()
-
-    def _menu(self, pos):
-        t, s = self.t, self.t.sound
-        m = QMenu(self)
-        if s.url:
-            m.addAction("Otevřít na freesound.org", lambda: QDesktopServices.openUrl(QUrl(s.url)))
-        pan = m.addMenu("Panorama")
-        for label, v in [("Vlevo", -0.7), ("Střed", 0.0), ("Vpravo", 0.7)]:
-            a = pan.addAction(label, lambda v=v: setattr(t, "pan", v))
-            a.setCheckable(True)
-            a.setChecked(abs(t.pan - v) < 0.01)
-        cp = m.addMenu("Kopírovat do kategorie")
-        for ns in self.main.lib:
-            if ns != s.namespace:
-                cp.addAction(ns, lambda ns=ns: self.main.copy_to(s, ns))
-        cp.addSeparator()
-        cp.addAction("Nová kategorie…", lambda: self.main.copy_to(s, None))
-        m.addSeparator()
-        m.addAction("Smazat z knihovny", lambda: self.main.delete_sound(t))
-        m.exec(self.btn.mapToGlobal(pos))
-
-
-class GroupColumn(QFrame):
-    def __init__(self, main: "MainWindow", ns: str):
-        super().__init__()
-        self.main, self.ns = main, ns
-        self.g = main.engine.group(ns)
-        self.rows: dict[str, TrackRow] = {}
-        self.setObjectName("column")
-        self.setFixedWidth(340)
-        v = QVBoxLayout(self)
-        v.setContentsMargins(6, 6, 6, 6)
-        v.setSpacing(4)
-
-        top = QHBoxLayout()
-        self.name = QLabel(ns)
-        self.name.setObjectName("colname")
-        self.count = QLabel()
-        close = mkbtn("✕", tip="Zavřít sloupec (zvuky zůstanou v knihovně)")
-        close.setFixedWidth(26)
-        close.clicked.connect(lambda: main.set_column_open(ns, False))
-        top.addWidget(self.name, 1)
-        top.addWidget(self.count)
-        top.addWidget(close)
-        v.addLayout(top)
-
-        ctl = QHBoxLayout()
-        self.mute = mkbtn("M", True, "mute", "Ztlumit kategorii")
-        self.solo = mkbtn("S", True, "solo", "Sólo kategorie")
-        for b in (self.mute, self.solo):
-            b.setFixedWidth(30)
-        self.mute.toggled.connect(lambda on: setattr(self.g, "mute", on))
-        self.solo.toggled.connect(lambda on: setattr(self.g, "solo", on))
-        rnd = mkbtn("Náh.", tip="Náhodně zapnout 3 zvuky z kategorie (ostatní vypnout)")
-        rnd.setFixedWidth(42)
-        rnd.clicked.connect(self.randomize)
-        off = mkbtn("Vyp", tip="Vypnout všechny zvuky v kategorii")
-        off.setFixedWidth(40)
-        off.clicked.connect(lambda: [main.toggle(r.t, False) for r in self.rows.values() if r.t.on])
-        self.vol = mkslider(int(self.g.volume * 100), tip="Hlasitost kategorie")
-        self.vol.valueChanged.connect(lambda val: setattr(self.g, "volume", val / 100))
-        for w in (self.mute, self.solo, rnd, off):
-            ctl.addWidget(w)
-        ctl.addWidget(self.vol, 1)
-        v.addLayout(ctl)
-
-        self.filter = QLineEdit()
-        self.filter.setPlaceholderText("filtr…")
-        self.filter.setClearButtonEnabled(True)
-        self.filter.textChanged.connect(self.apply_filter)
-        v.addWidget(self.filter)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.inner = QWidget()
-        self.list = QVBoxLayout(self.inner)
-        self.list.setContentsMargins(0, 0, 4, 0)
-        self.list.setSpacing(2)
-        self.list.addStretch(1)
-        self.scroll.setWidget(self.inner)
-        v.addWidget(self.scroll, 1)
-        self.sync_controls()
-        self.set_sounds(main.lib.get(ns, []))
-
-    def sync_controls(self):
-        for w, val in ((self.mute, self.g.mute), (self.solo, self.g.solo)):
-            w.blockSignals(True)
-            w.setChecked(val)
-            w.blockSignals(False)
-        self.vol.blockSignals(True)
-        self.vol.setValue(int(self.g.volume * 100))
-        self.vol.blockSignals(False)
-
-    def set_sounds(self, sounds: list[Sound]):
-        keys = [s.key for s in sounds]
-        for k in list(self.rows):
-            if k not in keys:
-                self.rows.pop(k).deleteLater()
-        for i, s in enumerate(sounds):
-            row = self.rows.get(s.key)
-            if row is None:
-                row = TrackRow(self.main, self.main.engine.tracks[s.key])
-                self.rows[s.key] = row
-            self.list.insertWidget(i, row)
-        self.apply_filter(self.filter.text())
-        self.update_count()
-
-    def apply_filter(self, text):
-        words = text.lower().split()
-        for r in self.rows.values():
-            hay = f"{r.t.sound.title} {r.t.sound.username}".lower()
-            r.setVisible(all(w in hay for w in words))
-
-    def update_count(self):
-        on = sum(1 for r in self.rows.values() if r.t.on)
-        self.count.setText(f"{on}/{len(self.rows)}")
-
-    def randomize(self):
-        visible = [r.t for r in self.rows.values() if r.isVisible()]
-        pick = set(random.sample(visible, min(3, len(visible))))
-        for r in self.rows.values():
-            want = r.t in pick
-            if r.t.on != want:
-                self.main.toggle(r.t, want)
-
-
-class ExportDialog(QDialog):
-    def __init__(self, parent, n_tracks: int, bpm: float):
-        super().__init__(parent)
-        self.setWindowTitle("Export")
-        f = QFormLayout(self)
-        f.addRow(QLabel(f"Aktivních zvuků: <b>{n_tracks}</b> · tempo {bpm:g} BPM"))
-        self.bars = QSpinBox()
-        self.bars.setRange(1, 1024)
-        self.bars.setValue(32)
-        self.bars.setSuffix(" taktů")
-        f.addRow("Délka:", self.bars)
-        self.mix = QCheckBox("Mix (stereo WAV 24 bit)")
-        self.mix.setChecked(True)
-        self.stems = QCheckBox("Stopy po kategoriích (stems)")
-        self.stems.setChecked(True)
-        self.loops = QCheckBox("Jednotlivé smyčky (1 opakování, pro DAW)")
-        for w in (self.mix, self.stems, self.loops):
-            f.addRow(w)
-        self.folder = QLineEdit(str(config.EXPORT_DIR / datetime.now().strftime("mix_%Y%m%d_%H%M%S")))
-        f.addRow("Složka:", self.folder)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        f.addRow(bb)
-
-
-# ======================================================================= hlavní okno
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Novotného Sound Studio")
         self.resize(1500, 900)
         self.engine = Engine()
+        self.deck = self.engine.new_deck("Mix")      # jeden mixer
         self.output = create_output(self.engine)
-        self.bridge = Bridge()
-        self.bridge.loaded.connect(self._on_loaded)
-        self.pool = ThreadPoolExecutor(max_workers=4)
+        self.svc = AudioService(self.engine)
+        self.svc.failed.connect(lambda k, err: self.log.appendPlainText(f"Nelze načíst {k}: {err}"))
+        self.svc.loaded.connect(lambda key: self.mixer.refresh_rows(key))
         self.lib: dict[str, list[Sound]] = {}
-        self.columns: dict[str, GroupColumn] = {}
-        self.scenes: dict[str, list[str]] = {}
+        self.sounds: dict[str, Sound] = {}
         self.dl: DownloadThread | None = None
-        self.watch: set[str] = set()
         self.rec_started = 0.0
 
         self._build_ui()
-        self._build_menu()
         self.rescan()
         if not self.load_session(config.SESSION_FILE):
-            for ns in list(self.lib)[:6]:
+            for ns in list(self.lib)[:4]:
                 self.set_column_open(ns, True)
+        self.post.refresh()
         self.output.start()
         self.statusBar().showMessage(f"Zvukový výstup: {self.output.name}  ·  knihovna: {config.LIBRARY_DIR}")
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
-        self.timer.start(40)
+        self.timer.start(50)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -418,7 +91,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 4)
 
-        # --- transport
         tr = QHBoxLayout()
         self.play_btn = mkbtn("▶  Play", True, "play", "Play / Stop (mezerník)")
         self.play_btn.setMinimumWidth(100)
@@ -433,57 +105,42 @@ class MainWindow(QMainWindow):
         self.quant = nofocus(QComboBox())
         for k, label in QUANTIZE:
             self.quant.addItem(label, k)
-        self.quant.setCurrentIndex(1)
+        self.quant.setCurrentIndex(2)
         self.quant.setToolTip("Kdy se zapnutí/vypnutí zvuku projeví")
         self.quant.currentIndexChanged.connect(lambda i: setattr(self.engine, "quantize", self.quant.itemData(i)))
         self.pos = QLabel()
-        self.pos.setMinimumWidth(150)
+        self.pos.setMinimumWidth(130)
         self.pos.setStyleSheet("font-family: monospace; font-size: 15px;")
         self.master = mkslider(int(self.engine.master * 100), tip="Master hlasitost")
-        self.master.setFixedWidth(160)
+        self.master.setMinimumWidth(70)
+        self.master.setMaximumWidth(150)
         self.master.valueChanged.connect(lambda v: setattr(self.engine, "master", v / 100))
         self.meter = QProgressBar()
         self.meter.setRange(0, 100)
         self.meter.setTextVisible(False)
-        self.meter.setFixedWidth(140)
         self.meter.setFixedHeight(12)
-        self.rec_btn = mkbtn("● REC", True, "rec", "Nahrávat výstup do WAV (živé hraní)")
-        self.rec_btn.toggled.connect(self.set_recording)
-        exp = mkbtn("Export…", tip="Vyrenderovat aktuální stav do WAV (mix / stopy / smyčky)")
-        exp.clicked.connect(self.export)
+        self.meter.setMinimumWidth(50)
+        self.meter.setMaximumWidth(130)
         panic = mkbtn("Vše vypnout", tip="Vypnout všechny zvuky (Esc)")
         panic.clicked.connect(self.all_off)
+        self.rec_btn = mkbtn("● REC", True, "rec",
+                             "Nahrávat – po zastavení se nahrávka otevře v Postprodukci")
+        self.rec_btn.toggled.connect(self.set_recording)
         for w in (self.play_btn, self.bpm, self.quant, self.pos):
             tr.addWidget(w)
-        tr.addSpacing(12)
+        tr.addSpacing(10)
         tr.addWidget(QLabel("Master"))
         tr.addWidget(self.master)
         tr.addWidget(self.meter)
         tr.addStretch(1)
-        for w in (panic, self.rec_btn, exp):
-            tr.addWidget(w)
+        tr.addWidget(panic)
+        tr.addWidget(self.rec_btn)
         root.addLayout(tr)
 
-        # --- scény
-        sc = QHBoxLayout()
-        sc.addWidget(QLabel("Scény:"))
-        self.scene_btns = []
-        for i in range(1, N_SCENES + 1):
-            b = mkbtn(str(i), name="scene",
-                      tip=f"Scéna {i}: klik = vyvolat · Ctrl+klik nebo pravé tlačítko = uložit aktuální stav")
-            b.clicked.connect(lambda _=False, i=i: self._scene_click(i))
-            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            b.customContextMenuRequested.connect(lambda _p, i=i: self._scene_menu(i))
-            sc.addWidget(b)
-            self.scene_btns.append(b)
-        sc.addStretch(1)
-        root.addLayout(sc)
-
-        # --- levý panel
+        # --- záložka Mix: vlevo stahování + knihovna, vpravo sloupce
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
-
         dlbox = QGroupBox("Stáhnout z freesound.org")
         dv = QVBoxLayout(dlbox)
         self.urls = QPlainTextEdit()
@@ -528,7 +185,7 @@ class MainWindow(QMainWindow):
         dv.addWidget(self.log, 1)
         lv.addWidget(dlbox, 3)
 
-        libbox = QGroupBox("Knihovna – kategorie (zaškrtnuté = v mixeru)")
+        libbox = QGroupBox("Knihovna – kategorie (zaškrtnuté = v mixu)")
         lbv = QVBoxLayout(libbox)
         self.lib_list = QListWidget()
         self.lib_list.itemChanged.connect(self._lib_item_changed)
@@ -536,67 +193,59 @@ class MainWindow(QMainWindow):
         self.lib_list.customContextMenuRequested.connect(self._lib_menu)
         lbv.addWidget(self.lib_list, 1)
         lh = QHBoxLayout()
-        b = mkbtn("Obnovit")
-        b.clicked.connect(self.rescan)
-        lh.addWidget(b)
-        b = mkbtn("Importovat soubory…")
-        b.clicked.connect(self.import_files)
-        lh.addWidget(b)
-        b = mkbtn("Složka")
-        b.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(config.LIBRARY_DIR))))
-        lh.addWidget(b)
+        for text, fn in (("Obnovit", self.rescan), ("Importovat soubory…", self.import_files),
+                         ("Složka", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(config.LIBRARY_DIR))))):
+            b = mkbtn(text)
+            b.clicked.connect(fn)
+            lh.addWidget(b)
         lbv.addLayout(lh)
         lv.addWidget(libbox, 2)
 
-        # --- mixer
-        self.mix_scroll = QScrollArea()
-        self.mix_scroll.setWidgetResizable(True)
-        self.mix_inner = QWidget()
-        self.mix_lay = QHBoxLayout(self.mix_inner)
-        self.mix_lay.setContentsMargins(4, 4, 4, 4)
-        self.mix_lay.addStretch(1)
-        self.mix_scroll.setWidget(self.mix_inner)
-        self.empty_hint = QLabel("Vlevo vlož URL tabu z freesound.org a stáhni zvuky,\n"
-                                 "nebo zaškrtni kategorii v knihovně.")
-        self.empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_hint.setStyleSheet("color: #888; font-size: 16px;")
-        self.mix_lay.insertWidget(0, self.empty_hint, 1)
-
+        self.mixer = MixerPanel(self)
         split = QSplitter()
         split.addWidget(left)
-        split.addWidget(self.mix_scroll)
+        split.addWidget(self.mixer)
         split.setStretchFactor(1, 1)
         split.setSizes([340, 1160])
-        root.addWidget(split, 1)
+
+        self.post = PostPanel(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(split, "Mix")
+        self.tabs.addTab(self.post, "Postprodukce")
+        self.tabs.currentChanged.connect(self._tab_changed)
+        root.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
 
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self, lambda: self.play_btn.toggle())
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._space)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.all_off)
-        for i in range(1, N_SCENES + 1):
-            QShortcut(QKeySequence(str(i)), self, lambda i=i: self.recall_scene(i))
 
-    def _build_menu(self):
         m = self.menuBar().addMenu("&Soubor")
         m.addAction("Otevřít session…", self._open_session)
         m.addAction("Uložit session jako…", self._save_session_as)
         m.addSeparator()
-        m.addAction("Export…", self.export)
         m.addAction("Otevřít složku exportů",
                     lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(config.EXPORT_DIR))))
         m.addSeparator()
-        a = QAction("Konec", self)
-        a.triggered.connect(self.close)
-        m.addAction(a)
+        m.addAction("Konec", self.close)
+
+    def _space(self):
+        if self.tabs.currentIndex() == TAB_POST:
+            self.post.toggle_play()
+        else:
+            self.play_btn.toggle()
+
+    def _tab_changed(self, i):
+        if i == TAB_POST:
+            self.post.refresh()
+            if self.post.editor is None:
+                self.post.open()
 
     # ------------------------------------------------------------------ knihovna
     def rescan(self):
         self.lib = library.scan_library()
-        for ns, sounds in self.lib.items():
-            for s in sounds:
-                self.engine.add_sound(s)
+        self.sounds = {s.key: s for ss in self.lib.values() for s in ss}
+        self.mixer.library_changed()
         self._refresh_lib_list()
-        for ns, col in self.columns.items():
-            col.set_sounds(self.lib.get(ns, []))
 
     def _refresh_lib_list(self):
         self.lib_list.blockSignals(True)
@@ -605,12 +254,19 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(f"{ns}  ({len(sounds)})")
             it.setData(Qt.ItemDataRole.UserRole, ns)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(Qt.CheckState.Checked if ns in self.columns else Qt.CheckState.Unchecked)
+            it.setCheckState(Qt.CheckState.Checked if ns in self.mixer.columns else Qt.CheckState.Unchecked)
             self.lib_list.addItem(it)
         self.lib_list.blockSignals(False)
 
     def _lib_item_changed(self, it: QListWidgetItem):
         self.set_column_open(it.data(Qt.ItemDataRole.UserRole), it.checkState() == Qt.CheckState.Checked)
+
+    def set_column_open(self, ns: str, open_: bool):
+        if open_:
+            self.mixer.open_column(ns)
+        else:
+            self.mixer.close_column(ns)
+        self._refresh_lib_list()
 
     def _lib_menu(self, pos):
         it = self.lib_list.itemAt(pos)
@@ -624,25 +280,20 @@ class MainWindow(QMainWindow):
         m.addAction("Smazat kategorii…", lambda: self.delete_namespace(ns))
         m.exec(self.lib_list.mapToGlobal(pos))
 
-    def set_column_open(self, ns: str, open_: bool):
-        if open_ and ns not in self.columns and ns in self.lib:
-            col = GroupColumn(self, ns)
-            self.columns[ns] = col
-            self.mix_lay.insertWidget(self.mix_lay.count() - 1, col)
-        elif not open_ and ns in self.columns:
-            self.columns.pop(ns).deleteLater()
-        self.empty_hint.setVisible(not self.columns)
-        self._refresh_lib_list()
+    def _drop_ns(self, ns: str):
+        self.mixer.close_column(ns)
+        for s in self.lib.get(ns, []):
+            self.engine.drop_sound(s.key)
+        self.deck.groups.pop(ns, None)
+        self.deck._groups_t = tuple(self.deck.groups.values())
 
     def rename_namespace(self, ns):
         new, ok = QInputDialog.getText(self, "Přejmenovat kategorii", "Nový název:", text=ns)
         new = library.safe_namespace(new) if ok else ""
         if not new or new == ns or (config.LIBRARY_DIR / new).exists():
             return
-        was_open = ns in self.columns
-        self.set_column_open(ns, False)
-        for s in self.lib.get(ns, []):
-            self.engine.remove_track(s.key)
+        was_open = ns in self.mixer.columns
+        self._drop_ns(ns)
         (config.LIBRARY_DIR / ns).rename(config.LIBRARY_DIR / new)
         self.rescan()
         self.set_column_open(new, was_open)
@@ -653,9 +304,7 @@ class MainWindow(QMainWindow):
                                 f"Opravdu smazat kategorii „{ns}“ a {n} souborů z disku?") \
                 != QMessageBox.StandardButton.Yes:
             return
-        self.set_column_open(ns, False)
-        for s in self.lib.get(ns, []):
-            self.engine.remove_track(s.key)
+        self._drop_ns(ns)
         shutil.rmtree(config.LIBRARY_DIR / ns, ignore_errors=True)
         self.rescan()
 
@@ -669,12 +318,12 @@ class MainWindow(QMainWindow):
             self.rescan()
             self.statusBar().showMessage(f"„{s.title}“ zkopírováno do {ns}", 4000)
 
-    def delete_sound(self, t: Track):
-        if QMessageBox.question(self, "Smazat", f"Smazat „{t.sound.title}“ z disku?") \
+    def delete_sound(self, s: Sound):
+        if QMessageBox.question(self, "Smazat", f"Smazat „{s.title}“ z disku?") \
                 != QMessageBox.StandardButton.Yes:
             return
-        self.engine.remove_track(t.key)
-        library.remove_sound(t.sound)
+        self.engine.drop_sound(s.key)
+        library.remove_sound(s)
         self.rescan()
 
     def import_files(self):
@@ -709,8 +358,7 @@ class MainWindow(QMainWindow):
         jobs = []
         for url in lines:
             ns = self.ns_edit.text().strip() if len(lines) == 1 else ""
-            ns = library.safe_namespace(ns or scraper.suggest_namespace(url))
-            jobs.append((url, ns))
+            jobs.append((url, library.safe_namespace(ns or scraper.suggest_namespace(url))))
         self.dl = DownloadThread(jobs, self.pages.value(), self.maxdur.value())
         self.dl.log.connect(self.log.appendPlainText)
         self.dl.progress.connect(lambda a, b: (self.dl_prog.setMaximum(b), self.dl_prog.setValue(a)))
@@ -729,99 +377,46 @@ class MainWindow(QMainWindow):
         self.dl_stop.setEnabled(False)
         self.dl = None
 
-    # ------------------------------------------------------------------ přehrávání
-    def load_track(self, t: Track):
-        if t.buffer is not None or t.loading:
-            return
-        t.loading = True
-        key, path = t.key, t.sound.path
-
-        def job():
-            try:
-                buf = library.load_audio(path)
-            except Exception as e:
-                buf = e
-            self.bridge.loaded.emit(key, buf)
-
-        self.pool.submit(job)
-
-    def _on_loaded(self, key, buf):
-        t = self.engine.tracks.get(key)
-        if t is None:
-            return
-        t.loading = False
-        if isinstance(buf, Exception):
-            t.want = False
-            self.log.appendPlainText(f"Nelze načíst {t.sound.file}: {buf}")
-        else:
-            self.engine.set_buffer(t, buf)
-            if t.want:
-                t.want = False
-                self.engine.request(t, True)
-        self.refresh_track(t)
-
-    def toggle(self, t: Track, on: bool):
-        if on and t.state is None:
-            t.want = True
-            self.load_track(t)
-        else:
-            t.want = False
-            self.engine.request(t, on)
-        self.refresh_track(t)
-
-    def refresh_track(self, t: Track):
-        col = self.columns.get(t.group)
-        if col and t.key in col.rows:
-            col.rows[t.key].refresh()
-            col.update_count()
-        if t.pending is not None or t.loading:
-            self.watch.add(t.key)
-
+    # ------------------------------------------------------------------ transport
     def set_playing(self, on: bool):
+        e = self.engine
         if on:
-            self.engine.play()
+            self.post.stop()
+            if not e.playing:
+                e.start_deck(self.deck)
         else:
-            self.engine.stop()
             if self.rec_btn.isChecked():
                 self.rec_btn.setChecked(False)
+            e.stop_all()
         self.play_btn.setText("■  Stop" if on else "▶  Play")
+
+    def stop_live(self):
+        if self.engine.playing:
+            self.play_btn.setChecked(False)
 
     def _bpm_changed(self, v):
         self.engine.set_bpm(v)
-        for col in self.columns.values():
-            for r in col.rows.values():
-                if r.t.buffer is not None:
+        for c in self.mixer.columns.values():
+            for r in c.rows.values():
+                if r.t.state is not None:
                     r.refresh()
 
     def all_off(self):
         self.engine.all_off()
-        for col in self.columns.values():
-            for r in col.rows.values():
-                r.refresh()
-            col.update_count()
+        self.mixer.refresh_rows()
 
     def _tick(self):
         e = self.engine
         self.meter.setValue(int(min(1.0, e.peak) * 100))
-        fpb = e.frames_per_beat
-        beat = int(e.frame // fpb)
+        if self.play_btn.isChecked() != e.playing:
+            set_checked(self.play_btn, e.playing)
+            self.play_btn.setText("■  Stop" if e.playing else "▶  Play")
+        beat = int(e.frame // e.fpb)
         bar, b = divmod(beat, BEATS_PER_BAR)
         dots = "".join("●" if i == b else "○" for i in range(BEATS_PER_BAR))
         self.pos.setText(f"{bar + 1:4d}  {dots}" if e.playing else "   –  ○○○○")
-        if self.watch:
-            done = set()
-            for key in self.watch:
-                t = e.tracks.get(key)
-                if t is None:
-                    done.add(key)
-                    continue
-                col = self.columns.get(t.group)
-                if col and key in col.rows:
-                    col.rows[key].refresh()
-                    col.update_count()
-                if t.pending is None and not t.loading:
-                    done.add(key)
-            self.watch -= done
+        for col in self.mixer.columns.values():
+            col.update_count()
         if e.recording:
             s = int(time.time() - self.rec_started)
             self.rec_btn.setText(f"● {s // 60:02d}:{s % 60:02d}")
@@ -829,145 +424,65 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText("Chyba v audio vlákně:\n" + e.last_error)
             e.last_error = ""
 
-    # ------------------------------------------------------------------ scény
-    def _scene_click(self, i):
-        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.store_scene(i)
-        else:
-            self.recall_scene(i)
-
-    def _scene_menu(self, i):
-        m = QMenu(self)
-        m.addAction("Uložit aktuální stav", lambda: self.store_scene(i))
-        m.addAction("Smazat", lambda: (self.scenes.pop(str(i), None), self._refresh_scene_btns()))
-        m.exec(self.cursor().pos())
-
-    def store_scene(self, i):
-        self.scenes[str(i)] = [t.key for t in self.engine.tracks.values() if t.on]
-        self._refresh_scene_btns()
-        self.statusBar().showMessage(f"Scéna {i} uložena ({len(self.scenes[str(i)])} zvuků)", 3000)
-
-    def recall_scene(self, i):
-        keys = self.scenes.get(str(i))
-        if keys is None:
-            return
-        keys = set(keys)
-        at = self.engine.next_boundary()
-        for t in self.engine.tracks.values():
-            want = t.key in keys
-            if t.on == want:
-                continue
-            if want and t.state is None:
-                t.want = True
-                self.load_track(t)
-            else:
-                t.want = False
-                self.engine.request(t, want, at)
-            self.refresh_track(t)
-
-    def _refresh_scene_btns(self):
-        for i, b in enumerate(self.scene_btns, 1):
-            b.setProperty("filled", "1" if self.scenes.get(str(i)) else "0")
-            repolish(b)
-
-    # ------------------------------------------------------------------ nahrávání / export
+    # ------------------------------------------------------------------ nahrávání
     def set_recording(self, on: bool):
+        e = self.engine
         if on:
             config.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
             path = config.EXPORT_DIR / datetime.now().strftime("rec_%Y%m%d_%H%M%S.wav")
-            self.engine.start_recording(path)
-            self.rec_started = time.time()
-            if not self.play_btn.isChecked():
+            if not e.playing:
                 self.play_btn.setChecked(True)
+            e.start_recording(path, Recorder(e))
+            self.rec_started = time.time()
             self.statusBar().showMessage(f"Nahrávám do {path}")
-        else:
-            res = self.engine.stop_recording()
-            self.rec_btn.setText("● REC")
-            if res:
-                path, used = res
-                sounds = [self.engine.tracks[k].sound for k in used if k in self.engine.tracks]
-                write_credits(path.with_name(path.stem + "_credits.txt"), sounds)
-                self.statusBar().showMessage(f"Nahrávka uložena: {path}", 8000)
-                self.log.appendPlainText(f"Nahrávka: {path}")
+            return
+        res = e.stop_recording()
+        self.rec_btn.setText("● REC")
+        if not res:
+            return
+        path, used, recorder = res
+        write_credits(path.with_name(path.stem + "_credits.txt"),
+                      [self.sounds[k] for k in used if k in self.sounds])
+        arr = recorder.finish(e)
+        arr.audio, arr.name = str(path), path.stem
+        if not arr.lanes:
+            self.statusBar().showMessage(f"Nahrávka uložena: {path} (nic nehrálo)", 8000)
+            return
+        apath = path.with_name(path.stem + ".arr.json")
+        arr.save(apath)
+        self.log.appendPlainText(f"Nahrávka: {path}")
+        self.statusBar().showMessage("Nahrávka uložena – je v záložce Postprodukce", 8000)
+        self.post.refresh()
+        self.post.open(apath)
+        self.tabs.setCurrentIndex(TAB_POST)
 
-    def export(self):
-        tracks = [t for t in self.engine.tracks.values() if t.on]
-        if not tracks:
-            QMessageBox.information(self, "Export", "Nejsou zapnuté žádné zvuky.")
-            return
-        dlg = ExportDialog(self, len(tracks), self.engine.bpm)
-        if not dlg.exec():
-            return
-        out = Path(dlg.folder.text()).expanduser()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            files = self.do_export(out, dlg.bars.value(), dlg.mix.isChecked(),
-                                   dlg.stems.isChecked(), dlg.loops.isChecked())
-        except Exception as ex:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Export", f"Export selhal:\n{ex}")
-            return
-        QApplication.restoreOverrideCursor()
-        self.log.appendPlainText(f"Export do {out}: {len(files)} souborů")
-        if QMessageBox.information(self, "Export hotov", f"Uloženo {len(files)} souborů do\n{out}",
-                                   QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Ok) \
-                == QMessageBox.StandardButton.Open:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
-
-    def do_export(self, out: Path, bars: int, mix=True, stems=True, loops=False) -> list[str]:
-        e = self.engine
-        tracks = [t for t in e.tracks.values() if t.on]
-        for t in tracks:
-            if t.state is None:
-                e.set_buffer(t, library.load_audio(t.sound.path))
-        out.mkdir(parents=True, exist_ok=True)
-        frames = e.frames_for_bars(bars)
-        files = []
-        if mix:
-            e.render_offline(out / "mix.wav", frames, tracks)
-            files.append("mix.wav")
-        if stems:
-            for ns in sorted({t.group for t in tracks}):
-                if e.groups[ns].mute:
-                    continue
-                name = f"stem_{library.slug(ns, 50)}.wav"
-                e.render_offline(out / name, frames, [t for t in tracks if t.group == ns], limiter=False)
-                files.append(name)
-        if loops:
-            for t in tracks:
-                name = f"loops/{library.slug(t.group, 20)}__{library.slug(t.sound.title, 50)}.wav"
-                e.render_offline(out / name, t.state[1], [t], respect_groups=False,
-                                 limiter=False, master=1.0)
-                files.append(name)
-        write_credits(out / "CREDITS.txt", [t.sound for t in tracks])
-        (out / "export.json").write_text(json.dumps(
-            {"bpm": e.bpm, "bars": bars, "session": self.session_dict()},
-            ensure_ascii=False, indent=1), "utf-8")
-        return files
+    def refresh_recordings(self):
+        self.post.refresh()
 
     # ------------------------------------------------------------------ session
     def session_dict(self) -> dict:
-        e = self.engine
+        e, d = self.engine, self.deck
         tracks = {}
-        for t in e.tracks.values():
-            d = {}
+        for t in d.tracks.values():
+            td = {}
             if t.on:
-                d["enabled"] = True
+                td["enabled"] = True
             if abs(t.volume - 0.8) > 1e-3:
-                d["volume"] = round(t.volume, 3)
+                td["volume"] = round(t.volume, 3)
             if t.pan:
-                d["pan"] = t.pan
+                td["pan"] = t.pan
             if t.length != "auto":
-                d["length"] = t.length
+                td["length"] = t.length
             if t.fit != (t.src_bpm is not None):
-                d["fit"] = t.fit
-            if d:
-                tracks[t.key] = d
+                td["fit"] = t.fit
+            if td:
+                tracks[t.key] = td
         return {
-            "bpm": e.bpm, "master": e.master, "quantize": e.quantize,
-            "columns": list(self.columns),
-            "groups": {n: {"volume": g.volume, "mute": g.mute, "solo": g.solo} for n, g in e.groups.items()},
-            "tracks": tracks, "scenes": self.scenes,
+            "version": 3, "bpm": e.bpm, "master": e.master, "quantize": e.quantize,
+            "geometry": bytes(self.saveGeometry().toHex()).decode(),
+            "columns": list(self.mixer.columns),
+            "groups": {n: {"volume": g.volume, "mute": g.mute, "solo": g.solo} for n, g in d.groups.items()},
+            "tracks": tracks,
         }
 
     def save_session(self, path: Path):
@@ -979,45 +494,49 @@ class MainWindow(QMainWindow):
             d = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
-        e = self.engine
+        if d.get("decks"):          # session z verze s decky -> vezme se první deck
+            d = {**d, **d["decks"][0]}
+        e, deck = self.engine, self.deck
         self.all_off()
         self.bpm.setValue(float(d.get("bpm", 130)))
         self.master.setValue(int(d.get("master", 0.8) * 100))
-        q = d.get("quantize", "beat")
-        self.quant.setCurrentIndex(next((i for i, (k, _) in enumerate(QUANTIZE) if k == q), 1))
+        q = d.get("quantize", "bar")
+        self.quant.setCurrentIndex(next((i for i, (k, _) in enumerate(QUANTIZE) if k == q), 2))
+        if d.get("geometry"):
+            self.restoreGeometry(QByteArray.fromHex(d["geometry"].encode()))
         for n, gd in d.get("groups", {}).items():
-            g = e.group(n)
+            g = deck.group(n)
             g.volume = float(gd.get("volume", 0.8))
-            g.mute = bool(gd.get("mute"))
-            g.solo = bool(gd.get("solo"))
+            g.mute, g.solo = bool(gd.get("mute")), bool(gd.get("solo"))
         for key, td in d.get("tracks", {}).items():
-            t = e.tracks.get(key)
-            if t is None:
+            s = self.sounds.get(key)
+            if s is None:
                 continue
+            t = e.track(deck, s)
             t.volume = float(td.get("volume", 0.8))
             t.pan = float(td.get("pan", 0.0))
-            t.length = td.get("length", "auto") if td.get("length", "auto") in LENGTH_OPTIONS else "auto"
+            ln = td.get("length", "auto")
+            t.length = ln if ln in LENGTH_OPTIONS else "auto"
             t.fit = bool(td.get("fit", t.src_bpm is not None))
-            if t.buffer is not None:
-                e.prepare(t)
+            e.prepare(t)
             if td.get("enabled"):
-                self.toggle(t, True)
-        self.scenes = {k: v for k, v in d.get("scenes", {}).items()}
-        self._refresh_scene_btns()
-        for ns in list(self.columns):
-            self.set_column_open(ns, False)
+                if t.state is not None:
+                    t.enabled = True
+                else:
+                    t.want = True
+                    self.svc.ensure_loaded(s)
+        for ns in list(self.mixer.columns):
+            self.mixer.close_column(ns)
         for ns in d.get("columns", []):
-            self.set_column_open(ns, True)
-        for col in self.columns.values():
-            col.sync_controls()
-            for r in col.rows.values():
-                r.sync_controls()
-            col.update_count()
+            self.mixer.open_column(ns)
+        self.mixer.sync_controls()
+        self._refresh_lib_list()
         return True
 
     def _open_session(self):
         p, _ = QFileDialog.getOpenFileName(self, "Otevřít session", str(config.HOME), "Session (*.json)")
         if p:
+            self.stop_live()
             self.load_session(Path(p))
 
     def _save_session_as(self):
@@ -1032,28 +551,12 @@ class MainWindow(QMainWindow):
             self.dl.wait(3000)
         if self.engine.recording:
             self.rec_btn.setChecked(False)
+        self.post.close_editor()
         self.save_session(config.SESSION_FILE)
         self.engine.playing = False
         self.output.stop()
-        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.svc.shutdown()
         super().closeEvent(ev)
-
-
-def dark_palette(app: QApplication):
-    app.setStyle("Fusion")
-    p = QPalette()
-    c = {
-        QPalette.ColorRole.Window: "#16181b", QPalette.ColorRole.WindowText: "#d8dce0",
-        QPalette.ColorRole.Base: "#111315", QPalette.ColorRole.AlternateBase: "#1b1e21",
-        QPalette.ColorRole.Text: "#d8dce0", QPalette.ColorRole.Button: "#25282c",
-        QPalette.ColorRole.ButtonText: "#d8dce0", QPalette.ColorRole.Highlight: "#2f7de1",
-        QPalette.ColorRole.HighlightedText: "#ffffff", QPalette.ColorRole.ToolTipBase: "#25282c",
-        QPalette.ColorRole.ToolTipText: "#e8e8e8", QPalette.ColorRole.PlaceholderText: "#6b7178",
-    }
-    for role, col in c.items():
-        p.setColor(role, QColor(col))
-    app.setPalette(p)
-    app.setStyleSheet(STYLE)
 
 
 def main():

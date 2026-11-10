@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 import unicodedata
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -117,22 +117,29 @@ def scan_library() -> dict[str, list[Sound]]:
     return result
 
 
-def import_files(paths: list[str], ns: str) -> int:
-    """Zkopíruje lokální audio soubory do kategorie."""
+def import_file(src: Path, ns: str) -> Sound | None:
+    """Zkopíruje lokální audio soubor do kategorie a vrátí ho jako Sound."""
+    src = Path(src)
+    if src.suffix.lower() not in AUDIO_EXT:
+        return None
     d = namespace_dir(ns)
     meta = load_meta(ns)
-    n = 0
-    for src in map(Path, paths):
-        if src.suffix.lower() not in AUDIO_EXT:
-            continue
-        uid = f"local:{slug(src.stem, 60)}"
-        dst = d / f"{slug(src.stem, 60)}{src.suffix.lower()}"
-        if not dst.exists():
-            shutil.copy2(src, dst)
-        meta[uid] = {"title": src.stem, "file": dst.name, "source": str(src)}
-        n += 1
+    base, ext = slug(src.stem, 60), src.suffix.lower()
+    dst, i = d / f"{base}{ext}", 2
+    # stejný název, jiný soubor -> nepřepisovat, přidat číslo
+    while dst.exists() and dst.resolve() != src.resolve() and dst.stat().st_size != src.stat().st_size:
+        dst, i = d / f"{base}_{i}{ext}", i + 1
+    if not dst.exists():
+        shutil.copy2(src, dst)
+    uid = f"local:{dst.stem}"
+    meta[uid] = {"title": src.stem, "file": dst.name, "source": str(src)}
     save_meta(ns, meta)
-    return n
+    return Sound(uid=uid, title=src.stem, file=dst.name, namespace=ns, source=str(src))
+
+
+def import_files(paths: list[str], ns: str) -> int:
+    """Zkopíruje lokální audio soubory do kategorie."""
+    return sum(1 for p in paths if import_file(Path(p), ns) is not None)
 
 
 def copy_sound(sound: Sound, target_ns: str) -> bool:
