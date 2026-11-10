@@ -1,4 +1,4 @@
-# Novotného Sound Studio
+# Novotného Fakt Sound Studio
 
 Smyčkový mixer pro skládání techna a elektroniky ze zvuků z [freesound.org](https://freesound.org).
 
