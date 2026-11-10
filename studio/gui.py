@@ -71,8 +71,11 @@ class MainWindow(QMainWindow):
         self.sounds: dict[str, Sound] = {}
         self.dl: DownloadThread | None = None
         self.rec_started = 0.0
+        self.break_beat = 0.0
 
         self._build_ui()
+        self.ext = None
+        self._extensions_menu()
         self.rescan()
         if not self.load_session(config.SESSION_FILE):
             for ns in list(self.lib)[:4]:
@@ -121,6 +124,23 @@ class MainWindow(QMainWindow):
         self.meter.setFixedHeight(12)
         self.meter.setMinimumWidth(50)
         self.meter.setMaximumWidth(130)
+        self.active = QLabel()
+        self.active.setToolTip("Kolik zvuků je zapnutých")
+        self.max_spin = nofocus(QSpinBox())
+        self.max_spin.setRange(0, 32)
+        self.max_spin.setSpecialValueText("max ∞")
+        self.max_spin.setPrefix("max ")
+        self.max_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.max_spin.setToolTip("Kolik zvuků smí hrát najednou. Když zapneš další,\n"
+                                 "nejstarší se na takt vypne (∞ = bez limitu).\n"
+                                 "Snížení limitu rovnou proředí mix.")
+        self.max_spin.valueChanged.connect(self._max_changed)
+        self.break_btn = mkbtn("Break", True, "brk",
+                               "Break (B): na takt vypne všechno a zapamatuje si, co hrálo.\n"
+                               "Během breaku můžeš pustit pár zvuků (riser, pad…).\n"
+                               "Drop (B znovu): na takt vrátí původní mix.")
+        self.break_btn.setMinimumWidth(110)
+        self.break_btn.toggled.connect(self.set_break)
         panic = mkbtn("Vše vypnout", tip="Vypnout všechny zvuky (Esc)")
         panic.clicked.connect(self.all_off)
         self.rec_btn = mkbtn("● REC", True, "rec",
@@ -128,6 +148,10 @@ class MainWindow(QMainWindow):
         self.rec_btn.toggled.connect(self.set_recording)
         for w in (self.play_btn, self.bpm, self.quant, self.pos):
             tr.addWidget(w)
+        tr.addSpacing(10)
+        tr.addWidget(self.active)
+        tr.addWidget(self.max_spin)
+        tr.addWidget(self.break_btn)
         tr.addSpacing(10)
         tr.addWidget(QLabel("Master"))
         tr.addWidget(self.master)
@@ -218,6 +242,7 @@ class MainWindow(QMainWindow):
 
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._space)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.all_off)
+        QShortcut(QKeySequence(Qt.Key.Key_B), self, self._break_key)
 
         m = self.menuBar().addMenu("&Soubor")
         m.addAction("Otevřít session…", self._open_session)
@@ -228,11 +253,37 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction("Konec", self.close)
 
+    # ------------------------------------------------------------------ rozšíření
+    def _extensions_menu(self):
+        """Volitelná rozšíření (složka studio/experimental). Když v buildu chybí, menu se nepřidá."""
+        try:
+            from . import experimental
+        except ImportError:
+            return
+        m = self.menuBar().addMenu("&Nastavení")
+        a = m.addAction("Experimentální vzorce (záložka Vzorce)")
+        a.setCheckable(True)
+        a.setChecked(experimental.enabled())
+        a.toggled.connect(lambda on: (experimental.set_enabled(on), self._set_extension(on)))
+        self._set_extension(a.isChecked())
+
+    def _set_extension(self, on: bool):
+        from . import experimental
+        if on and self.ext is None:
+            self.ext = experimental.install(self)
+        elif not on and self.ext is not None:
+            self.ext.remove()
+            self.ext = None
+
     def _space(self):
         if self.tabs.currentIndex() == TAB_POST:
             self.post.toggle_play()
         else:
             self.play_btn.toggle()
+
+    def _break_key(self):
+        if self.tabs.currentIndex() == TAB_MIX:
+            self.break_btn.toggle()
 
     def _tab_changed(self, i):
         if i == TAB_POST:
@@ -384,6 +435,7 @@ class MainWindow(QMainWindow):
             self.post.stop()
             if not e.playing:
                 e.start_deck(self.deck)
+                self.break_beat = 0.0
         else:
             if self.rec_btn.isChecked():
                 self.rec_btn.setChecked(False)
@@ -405,9 +457,30 @@ class MainWindow(QMainWindow):
         self.engine.all_off()
         self.mixer.refresh_rows()
 
+    def _max_changed(self, v):
+        self.engine.max_tracks = v
+        self.mixer.enforce_limits()
+
+    def set_break(self, on: bool):
+        e = self.engine
+        at = e.deck_boundary(self.deck)
+        self.break_beat = (at if at >= 0 else e.frame) / e.fpb
+        self.mixer.set_break(on)
+
+    def _break_text(self) -> str:
+        if not self.break_btn.isChecked():
+            return "Break"
+        e = self.engine
+        if not e.playing:
+            return "Drop"
+        bars = (e.frame / e.fpb - self.break_beat) / BEATS_PER_BAR
+        return "Drop  · čeká" if bars < 0 else f"Drop  · {int(bars) + 1} t."
+
     def _tick(self):
         e = self.engine
         self.meter.setValue(int(min(1.0, e.peak) * 100))
+        self.active.setText(f"hraje {self.mixer.active_count()}")
+        self.break_btn.setText(self._break_text())
         if self.play_btn.isChecked() != e.playing:
             set_checked(self.play_btn, e.playing)
             self.play_btn.setText("■  Stop" if e.playing else "▶  Play")
@@ -462,10 +535,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ session
     def session_dict(self) -> dict:
         e, d = self.engine, self.deck
+        snap = self.mixer.snapshot        # během breaku uložit mix před breakem
         tracks = {}
         for t in d.tracks.values():
             td = {}
-            if t.on:
+            if (t.key in snap) if snap is not None else t.on:
                 td["enabled"] = True
             if abs(t.volume - 0.8) > 1e-3:
                 td["volume"] = round(t.volume, 3)
@@ -479,9 +553,11 @@ class MainWindow(QMainWindow):
                 tracks[t.key] = td
         return {
             "version": 3, "bpm": e.bpm, "master": e.master, "quantize": e.quantize,
+            "max_tracks": e.max_tracks,
             "geometry": bytes(self.saveGeometry().toHex()).decode(),
             "columns": list(self.mixer.columns),
-            "groups": {n: {"volume": g.volume, "mute": g.mute, "solo": g.solo} for n, g in d.groups.items()},
+            "groups": {n: {"volume": g.volume, "mute": g.target("mute"), "solo": g.target("solo"), "one": g.one}
+                       for n, g in d.groups.items()},
             "tracks": tracks,
         }
 
@@ -497,6 +573,8 @@ class MainWindow(QMainWindow):
         if d.get("decks"):          # session z verze s decky -> vezme se první deck
             d = {**d, **d["decks"][0]}
         e, deck = self.engine, self.deck
+        set_checked(self.break_btn, False)
+        self.mixer.snapshot = None
         self.all_off()
         self.bpm.setValue(float(d.get("bpm", 130)))
         self.master.setValue(int(d.get("master", 0.8) * 100))
@@ -507,7 +585,8 @@ class MainWindow(QMainWindow):
         for n, gd in d.get("groups", {}).items():
             g = deck.group(n)
             g.volume = float(gd.get("volume", 0.8))
-            g.mute, g.solo = bool(gd.get("mute")), bool(gd.get("solo"))
+            g.mute, g.solo, g.one = bool(gd.get("mute")), bool(gd.get("solo")), bool(gd.get("one"))
+            g.pending.clear()
         for key, td in d.get("tracks", {}).items():
             s = self.sounds.get(key)
             if s is None:
@@ -529,6 +608,10 @@ class MainWindow(QMainWindow):
             self.mixer.close_column(ns)
         for ns in d.get("columns", []):
             self.mixer.open_column(ns)
+        self.max_spin.blockSignals(True)
+        self.max_spin.setValue(int(d.get("max_tracks", 0)))
+        self.max_spin.blockSignals(False)
+        e.max_tracks = self.max_spin.value()
         self.mixer.sync_controls()
         self._refresh_lib_list()
         return True
@@ -552,6 +635,8 @@ class MainWindow(QMainWindow):
         if self.engine.recording:
             self.rec_btn.setChecked(False)
         self.post.close_editor()
+        if self.ext is not None:
+            self.ext.panel.shutdown()
         self.save_session(config.SESSION_FILE)
         self.engine.playing = False
         self.output.stop()

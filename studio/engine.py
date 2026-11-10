@@ -5,6 +5,10 @@ Pojmy:
            hlasitost a start/stop. Všechny decky sdílí jedno tempo.
   Track  – jeden zvuk v jednom decku; běží v nekonečné smyčce.
   Group  – kategorie (namespace) uvnitř decku – hlasitost / mute / solo.
+           Mute/solo se mění kvantizovaně (na takt), aby šly použít na break/drop.
+
+Minimalistika: Engine.max_tracks (kolik zvuků smí hrát najednou) a Group.one
+(jen jeden zvuk z kategorie). Při překročení se vypnou nejstarší (Track.seq).
 
 Čas: globální pozice `frame` (vzorky od Play). Pozice ve smyčce se počítá
 relativně ke startu decku: (frame - deck.start) % délka_smyčky – takže když deck
@@ -130,6 +134,7 @@ class Track:
         self.gain = np.zeros(2, np.float32)
         self.jump = False            # další blok bez náběhu (start decku na začátku smyčky)
         self.pending: tuple[bool, int] | None = None
+        self.seq = 0                 # pořadí zapnutí (limit vypíná nejstarší)
 
     @property
     def on(self) -> bool:
@@ -147,6 +152,13 @@ class Group:
         self.volume = 0.8
         self.mute = False
         self.solo = False
+        self.one = False             # jen jeden zvuk z kategorie najednou
+        self.pending: dict[str, tuple[bool, int]] = {}   # mute/solo naplánované na takt
+
+    def target(self, attr: str) -> bool:
+        """Hodnota mute/solo po naplánované změně."""
+        p = self.pending.get(attr)
+        return p[0] if p is not None else getattr(self, attr)
 
 
 class Deck:
@@ -200,6 +212,8 @@ class Engine:
         self.bpm = 130.0
         self.master = 0.8
         self.quantize = "bar"     # off | beat | bar
+        self.max_tracks = 0       # kolik zvuků smí hrát najednou (0 = bez limitu)
+        self._seq = 0
         self.playing = False
         self.frame = 0
         self.peak = 0.0
@@ -326,6 +340,8 @@ class Engine:
                 for t in d.tracks.values():
                     if t.pending is not None:
                         t.pending = (t.pending[0], sc(t.pending[1]))
+                for g in d._groups_t:
+                    g.pending = {k: (v, sc(at)) for k, (v, at) in g.pending.items()}
             self.bpm = float(bpm)
             for d in self._decks_t:
                 for t in d._live:
@@ -361,6 +377,37 @@ class Engine:
                 t.enabled = on
             else:
                 t.pending = (on, at)
+
+    def set_group(self, d: Deck, g: Group, attr: str, value: bool):
+        """Mute/solo kategorie – kvantizovaně jako zapínání zvuků."""
+        with self.lock:
+            if value == getattr(g, attr):
+                g.pending.pop(attr, None)
+                return
+            at = self.deck_boundary(d)
+            if at < 0 or at <= self.frame:
+                g.pending.pop(attr, None)
+                setattr(g, attr, value)
+            else:
+                g.pending[attr] = (value, at)
+
+    def mark_on(self, t: Track):
+        """Zaznamená pořadí zapnutí (pro limit)."""
+        self._seq += 1
+        t.seq = self._seq
+
+    def over_limit(self, d: Deck) -> list[Track]:
+        """Zapnuté zvuky nad limit (max. počet, 1× v kategorii) – vždy ty nejstarší."""
+        on = sorted((t for t in d.tracks.values() if t.on), key=lambda t: t.seq, reverse=True)
+        keep, seen, out = 0, set(), []
+        for t in on:
+            g = d.groups.get(t.group)
+            if (g is not None and g.one and t.group in seen) or (self.max_tracks and keep >= self.max_tracks):
+                out.append(t)
+            else:
+                keep += 1
+                seen.add(t.group)
+        return out
 
     def start_deck(self, d: Deck):
         with self.lock:
@@ -455,6 +502,10 @@ class Engine:
                     if t.pending is not None:
                         t.enabled, t.pending = t.pending[0], None
                     t.gain = ZERO2.copy()
+                for g in d._groups_t:
+                    for attr, (v, _) in g.pending.items():
+                        setattr(g, attr, v)
+                    g.pending.clear()
             self.playing = False
             self.frame = 0
 
@@ -476,6 +527,12 @@ class Engine:
 
     def _apply_events(self, f: int):
         for d in self._decks_t:
+            for g in d._groups_t:
+                if g.pending:
+                    for attr, (v, at) in list(g.pending.items()):
+                        if at <= f:
+                            setattr(g, attr, v)
+                            del g.pending[attr]
             if d.stop is not None and d.stop <= f:
                 d.start = d.stop = d._sched_start = d._linked_stop = None
                 for t in d._live:
@@ -545,6 +602,10 @@ class Engine:
                 p = t.pending
                 if p is not None and s < p[1] < e:
                     cuts.add(p[1])
+            for g in d._groups_t:
+                for _, at in g.pending.values():
+                    if s < at < e:
+                        cuts.add(at)
         a = s
         for c in sorted(cuts) + [e]:
             self._apply_events(a)

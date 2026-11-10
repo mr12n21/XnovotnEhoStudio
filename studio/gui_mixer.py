@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from .engine import LENGTH_OPTIONS, Track, length_label, loop_beats
-from .gui_common import mkbtn, mkslider, nofocus, set_checked, set_value
+from .gui_common import mkbtn, mkslider, nofocus, repolish, set_checked, set_value
 from .library import Sound
 
 if TYPE_CHECKING:
@@ -121,7 +121,11 @@ class TrackRow(QWidget):
         if t.pending is not None:
             return "pend" if t.pending[0] else "off-pend"
         if t.enabled:
-            return "on" if self.mixer.deck.running_at(self.mixer.engine.frame) else "idle"
+            d, e = self.mixer.deck, self.mixer.engine
+            if not d.running_at(e.frame):
+                return "idle"
+            # zapnutý, ale neslyšet (mute/solo kategorie) -> tmavší
+            return "on" if e.track_gain(t, d, any(g.solo for g in d._groups_t)) > 0 else "idle"
         return ""
 
     def peaks(self):
@@ -242,15 +246,18 @@ class GroupColumn(QFrame):
         ctl = QHBoxLayout()
         self.mute = mkbtn("M", True, "mute", "Ztlumit kategorii", width=30)
         self.solo = mkbtn("S", True, "solo", "Sólo kategorie", width=30)
-        self.mute.toggled.connect(lambda on: setattr(self.g, "mute", on))
-        self.solo.toggled.connect(lambda on: setattr(self.g, "solo", on))
+        self.mute.toggled.connect(lambda on: self._set_group("mute", on))
+        self.solo.toggled.connect(lambda on: self._set_group("solo", on))
+        self.one = mkbtn("1×", True, "one", "Jen jeden zvuk z kategorie najednou\n"
+                         "(zapnutí dalšího vypne předchozí – např. jeden kick)", width=30)
+        self.one.toggled.connect(self._set_one)
         rnd = mkbtn("Náh.", tip="Náhodně zapnout 3 zvuky z kategorie (ostatní vypnout)", width=42)
         rnd.clicked.connect(self.randomize)
         off = mkbtn("Vyp", tip="Vypnout všechny zvuky v kategorii", width=40)
         off.clicked.connect(lambda: [mixer.toggle(r.t, False) for r in self.rows.values() if r.t.on])
         self.vol = mkslider(int(self.g.volume * 100), tip="Hlasitost kategorie")
         self.vol.valueChanged.connect(lambda val: setattr(self.g, "volume", val / 100))
-        for w in (self.mute, self.solo, rnd, off):
+        for w in (self.mute, self.solo, self.one, rnd, off):
             ctl.addWidget(w)
         ctl.addWidget(self.vol, 1)
         v.addLayout(ctl)
@@ -275,9 +282,26 @@ class GroupColumn(QFrame):
         self.set_sounds(mixer.main.lib.get(ns, []))
 
     def sync_controls(self):
-        set_checked(self.mute, self.g.mute)
-        set_checked(self.solo, self.g.solo)
+        set_checked(self.mute, self.g.target("mute"))
+        set_checked(self.solo, self.g.target("solo"))
+        set_checked(self.one, self.g.one)
         set_value(self.vol, int(self.g.volume * 100))
+
+    def _set_group(self, attr: str, on: bool):
+        self.mixer.engine.set_group(self.mixer.deck, self.g, attr, on)
+        self.tick()
+
+    def _set_one(self, on: bool):
+        self.g.one = on
+        self.mixer.enforce_limits()
+
+    def tick(self):
+        """M/S čekající na takt mají žlutý okraj."""
+        for b, attr in ((self.mute, "mute"), (self.solo, "solo")):
+            pend = attr in self.g.pending
+            if bool(b.property("pending")) != pend:
+                b.setProperty("pending", pend)
+                repolish(b)
 
     def set_sounds(self, sounds: list[Sound]):
         keys = {s.key for s in sounds}
@@ -305,7 +329,7 @@ class GroupColumn(QFrame):
 
     def randomize(self):
         visible = [r.t for r in self.rows.values() if r.isVisible()]
-        pick = set(random.sample(visible, min(3, len(visible))))
+        pick = set(random.sample(visible, min(1 if self.g.one else 3, len(visible))))
         for r in self.rows.values():
             want = r.t in pick
             if r.t.on != want:
@@ -317,6 +341,7 @@ class MixerPanel(QScrollArea):
         super().__init__()
         self.main, self.engine, self.deck = main, main.engine, main.deck
         self.columns: dict[str, GroupColumn] = {}
+        self.snapshot: set[str] | None = None   # co hrálo před breakem (None = není break)
         self.setWidgetResizable(True)
         inner = QWidget()
         self.cols = QHBoxLayout(inner)
@@ -336,19 +361,50 @@ class MixerPanel(QScrollArea):
         if not self.isVisible():
             return
         for col in self.columns.values():
+            col.tick()
             for r in col.rows.values():
                 r.tick()
 
-    def toggle(self, t: Track, on: bool):
+    def toggle(self, t: Track, on: bool, limit: bool = True):
+        if on:
+            self.engine.mark_on(t)
         if on and t.state is None:
             t.want = True
             self.main.svc.ensure_loaded(t.sound)
         else:
             t.want = False
             self.engine.request(t, on)
+        if on and limit:
+            self.enforce_limits()
         col = self.columns.get(t.group)
         if col:
             col.update_count()
+
+    def enforce_limits(self):
+        """Vypne zvuky nad limit (max. počet / 1× v kategorii) – nejstarší první."""
+        for t in self.engine.over_limit(self.deck):
+            self.toggle(t, False)
+
+    def active_count(self) -> int:
+        return sum(1 for t in self.deck.tracks.values() if t.on)
+
+    def set_break(self, on: bool):
+        """Break: na takt vypne všechno a zapamatuje si to. Drop: na takt vrátí, co hrálo."""
+        tracks = list(self.deck.tracks.values())
+        if on:
+            self.snapshot = {t.key for t in tracks if t.on}
+            for t in tracks:
+                if t.on:
+                    self.toggle(t, False)
+        else:
+            snap = self.snapshot or set()
+            self.snapshot = None
+            for t in tracks:            # nejdřív vypnout, co přibylo během breaku
+                if t.on and t.key not in snap:
+                    self.toggle(t, False)
+            for t in sorted(tracks, key=lambda t: t.seq):   # zachová pořadí pro limit
+                if not t.on and t.key in snap:
+                    self.toggle(t, True, limit=False)
 
     def open_column(self, ns: str):
         if ns in self.columns or ns not in self.main.lib:

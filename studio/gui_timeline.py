@@ -10,6 +10,9 @@ Nahoře vlna celého mixu (kde jsou dropy), pod ní stopa pro každý zvuk.
   Ctrl + kolečko        zoom
 Režim „Křivka hlasitosti“ (žluté čáry): klik = bod, táhni = posun bodu,
 dvojklik na bod = smazat. Nahoře v MIX je křivka celého mixu.
+Stejně se kreslí křivky úprav „Špičky“ (ztlumit, co je výrazně hlasitější než
+zbytek) a „Šum“ (ztlumit tiché věci mezi zvuky) – síla 0–100 % v čase.
+Ve vlně MIX je tmavě vidět původní vlna, světle výsledek po úpravách.
 """
 from __future__ import annotations
 
@@ -30,8 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import config, library
-from .arrangement import (ENV_MAX, ArrPlayer, Arrangement, Compiled, CompiledLane, Lane, Region, bars_beats,
-                          env_frames, region_frames, render_peaks, render_to_file)
+from .arrangement import (ENV_MAX, ArrPlayer, Arrangement, Compiled, CompiledLane, Lane, Region, analyze_mix,
+                          bars_beats, env_frames, fx_pts, region_frames, render_to_file, with_fx)
 from .engine import BEATS_PER_BAR, LENGTH_OPTIONS, bpm_from_title, length_label, pan_gains, prepare_state
 from .gui_common import mkbtn, mkslider, nofocus, set_checked, set_value, write_credits
 from .waveform import compute_peaks
@@ -54,16 +57,36 @@ HINT = ("táhni úsek = posun · táhni okraj = zkrátit · dvojklik = přidat/s
         "táhni v pravítku = výběr času · Ctrl+kolečko = zoom · Shift+kolečko = posun")
 HINT_VOL = ("KŘIVKA HLASITOSTI: klik = přidat bod · táhni bod = nahoru hlasitěji / dolů tišeji · "
             "dvojklik na bod = smazat · pravé tlačítko = smazat křivku · nahoře v MIX = hlasitost celku")
+HINT_TAME = ("ŠPIČKY: kde je křivka nahoře, ztlumí se místa výrazně hlasitější než zbytek stopy "
+             "(dole = nechat) · klik = bod · táhni = síla · dvojklik = smazat · nahoře v MIX = celý mix")
+HINT_GATE = ("ŠUM: kde je křivka nahoře, ztlumí se tiché věci mezi zvuky – šum, brum, dozvuky "
+             "(dole = nechat) · klik = bod · táhni = síla · dvojklik = smazat · nahoře v MIX = celý mix")
+
+# druhy křivek: atribut na stopě / na nahrávce, neutrální hodnota (= nic), maximum, barvy
+CURVES = {
+    "vol": dict(attr="env", master="master_env", neutral=1.0, vmax=ENV_MAX, color=ENV_COLOR,
+                mcolor=MASTER_ENV_COLOR, label="Hlasitost", what="hlasitosti", hint=HINT_VOL,
+                tip="Kreslení hlasitosti myší: klik = bod, táhni = hlasitěji/tišeji, dvojklik = smazat bod"),
+    "tame": dict(attr="tame_env", master="tame_env", neutral=0.0, vmax=1.0, color=QColor("#ff6b8a"),
+                 mcolor=QColor("#ff6b8a"), label="Špičky", what="špiček", hint=HINT_TAME,
+                 tip="Kde ztlumit špičky – místa výrazně hlasitější než zbytek (přehnaný drop, ostrá rána).\n"
+                     "Křivka nahoře = silně, dole = nechat. Tichá místa se nemění."),
+    "gate": dict(attr="gate_env", master="gate_env", neutral=0.0, vmax=1.0, color=QColor("#5ee6a8"),
+                 mcolor=QColor("#5ee6a8"), label="Šum", what="šumu", hint=HINT_GATE,
+                 tip="Kde odfiltrovat šum – tiché věci pod úrovní zvuku (šum, brum, dozvuky mezi ranami)\n"
+                     "se ztlumí. Křivka nahoře = silně, dole = nechat. Hlasité části se nemění."),
+}
 
 
-def env_y(v: float, y0: float, y1: float) -> float:
-    return y1 - v / ENV_MAX * (y1 - y0)
+def env_y(v: float, y0: float, y1: float, cv=CURVES["vol"]) -> float:
+    return y1 - v / cv["vmax"] * (y1 - y0)
 
 
-def env_v(y: float, y0: float, y1: float) -> float:
-    v = (y1 - y) / (y1 - y0) * ENV_MAX
-    v = round(v * 20) / 20 if abs(v - 1.0) > 0.04 else 1.0     # po 5 %, u 100 % přichytí
-    return min(ENV_MAX, max(0.0, v))
+def env_v(y: float, y0: float, y1: float, cv=CURVES["vol"]) -> float:
+    vmax, n = cv["vmax"], cv["neutral"]
+    v = (y1 - y) / (y1 - y0) * vmax
+    v = round(v / vmax * 20) / 20 * vmax if abs(v - n) > 0.02 * vmax else n   # po 5 %, u neutrální přichytí
+    return min(vmax, max(0.0, v))
 
 
 def env_gain_at(pts: list, beats: np.ndarray):
@@ -73,23 +96,22 @@ def env_gain_at(pts: list, beats: np.ndarray):
 
 
 def draw_env(p: QPainter, pts: list, ppb: float, off: float, xl: float, xr: float,
-             y0: float, y1: float, color: QColor, handles: bool, drag_pt=None):
-    """Křivka hlasitosti; x = doba * ppb - off."""
+             y0: float, y1: float, color: QColor, handles: bool, drag_pt=None, cv=CURVES["vol"]):
+    """Křivka (hlasitost / úpravy); x = doba * ppb - off."""
+    ny = env_y(cv["neutral"], y0, y1, cv)
     if handles:
         p.setPen(QPen(QColor(255, 255, 255, 50), 1, Qt.PenStyle.DashLine))
-        y = env_y(1.0, y0, y1)
-        p.drawLine(QLineF(xl, y, xr, y))
+        p.drawLine(QLineF(xl, ny, xr, ny))
     if not pts:
         if handles:
             c = QColor(color)
             c.setAlpha(110)
             p.setPen(QPen(c, 1.5))
-            y = env_y(1.0, y0, y1)
-            p.drawLine(QLineF(xl, y, xr, y))
+            p.drawLine(QLineF(xl, ny, xr, ny))
         return
-    poly = [QPointF(xl, env_y(pts[0][1], y0, y1))]
-    poly += [QPointF(b * ppb - off, env_y(v, y0, y1)) for b, v in pts]
-    poly.append(QPointF(xr, env_y(pts[-1][1], y0, y1)))
+    poly = [QPointF(xl, env_y(pts[0][1], y0, y1, cv))]
+    poly += [QPointF(b * ppb - off, env_y(v, y0, y1, cv)) for b, v in pts]
+    poly.append(QPointF(xr, env_y(pts[-1][1], y0, y1, cv)))
     p.setPen(QPen(color, 2 if handles else 1.4))
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.drawPolyline(QPolygonF(poly))
@@ -99,10 +121,10 @@ def draw_env(p: QPainter, pts: list, ppb: float, off: float, xl: float, xr: floa
         for b, v in pts:
             x = b * ppb - off
             if xl - 6 <= x <= xr + 6:
-                p.drawEllipse(QPointF(x, env_y(v, y0, y1)), 4, 4)
+                p.drawEllipse(QPointF(x, env_y(v, y0, y1, cv)), 4, 4)
     if drag_pt is not None:
         b, v = drag_pt
-        x, y = b * ppb - off, env_y(v, y0, y1)
+        x, y = b * ppb - off, env_y(v, y0, y1, cv)
         txt = f"{v * 100:.0f} %"
         r = QRectF(x + 8, max(y0, min(y1 - 16, y - 8)), 52, 16)
         p.setPen(Qt.PenStyle.NoPen)
@@ -140,7 +162,7 @@ class TopBar(QWidget):
         if ev.button() != Qt.MouseButton.LeftButton:
             return
         if self._in_env(pos.y()):
-            post.env_press(post.arr, "master_env", self._beat(pos.x()), pos.y(), *self.ENV_Y)
+            post.env_press(post.arr, post.cv()["master"], self._beat(pos.x()), pos.y(), *self.ENV_Y)
             return
         b = post.snap_beat(self._beat(pos.x()))
         self.anchor = b
@@ -169,14 +191,15 @@ class TopBar(QWidget):
     def mouseDoubleClickEvent(self, ev):
         pos = ev.position()
         if self._in_env(pos.y()):
-            self.post.env_delete_at(self.post.arr, "master_env", self._beat(pos.x()), pos.y(), *self.ENV_Y)
+            self.post.env_delete_at(self.post.arr, self.post.cv()["master"], self._beat(pos.x()), pos.y(),
+                                    *self.ENV_Y)
 
     def contextMenuEvent(self, ev):
         post = self.post
         m = QMenu(self)
         if self._in_env(ev.pos().y()):
-            post.env_menu_items(m, post.arr, "master_env", self._beat(ev.pos().x()), ev.pos().y(), *self.ENV_Y,
-                                "Smazat křivku hlasitosti mixu")
+            post.env_menu_items(m, post.arr, post.cv()["master"], self._beat(ev.pos().x()), ev.pos().y(),
+                                *self.ENV_Y, f"Smazat křivku {post.cv()['what']} mixu")
         if not m.isEmpty():
             m.exec(ev.globalPos())
 
@@ -223,6 +246,11 @@ class TopBar(QWidget):
             idx = ((xs + off) / ppb / MIX_BUCKET_BEATS).astype(np.int64)
             ok = idx < len(pk)
             xs, idx = xs[ok], idx[ok]
+            raw = post.mix_raw
+            if raw is not None and len(raw) == len(pk):   # co úpravy (špičky, šum) ubraly
+                vals = raw[idx] * hh
+                p.setPen(QColor("#7a3b3b"))
+                p.drawLines([QLineF(x, mid - v, x, mid + v) for x, v in zip(xs.tolist(), vals.tolist())])
             vals = pk[idx] * hh
             p.setPen(QColor("#5ec8ff"))
             p.drawLines([QLineF(x, mid - v, x, mid + v) for x, v in zip(xs.tolist(), vals.tolist())])
@@ -230,12 +258,15 @@ class TopBar(QWidget):
             p.setPen(QColor("#555"))
             p.drawText(QRectF(8, RULER_H, w, MIX_H), Qt.AlignmentFlag.AlignVCenter, "počítám vlnu mixu…")
         y0, y1 = self.ENV_Y
-        if post.arr.master_env or post.vol_mode:
-            drag = post.env_drag_pt(post.arr, "master_env")
-            draw_env(p, post.arr.master_env, ppb, off, 0, w, y0, y1, MASTER_ENV_COLOR, post.vol_mode, drag)
+        for kind, cv in sorted(CURVES.items(), key=lambda kv: kv[0] == post.curve):   # aktivní navrch
+            pts, active = getattr(post.arr, cv["master"]), kind == post.curve
+            if pts or active:
+                draw_env(p, pts, ppb, off, 0, w, y0, y1, cv["mcolor"], active,
+                         post.env_drag_pt(post.arr, cv["master"]), cv)
         p.setPen(QColor("#888"))
-        p.drawText(QRectF(4, RULER_H + 2, 200, 14), Qt.AlignmentFlag.AlignLeft,
-                   "MIX – hlasitost celku" if post.vol_mode else "MIX")
+        p.drawText(QRectF(4, RULER_H + 2, 300, 14), Qt.AlignmentFlag.AlignLeft,
+                   f"MIX – {post.cv()['label'].lower()} celku" if post.vol_mode
+                   else "MIX · tmavě = před úpravami" if post.mix_raw is not None else "MIX")
         x = post.playhead * ppb - off
         p.setPen(QPen(QColor("#ff5050"), 1.5))
         p.drawLine(QLineF(x, 0, x, self.height()))
@@ -362,10 +393,12 @@ class Canvas(QWidget):
                 if r.fade_out > 0:
                     xf = max(x1, x2 - r.fade_out * ppb)
                     p.drawPolygon(QPolygonF([QPointF(x2, top), QPointF(xf, top), QPointF(x2, bot)]))
-            if lane.env or post.vol_mode:
-                y0, y1 = self.env_y(i)
-                draw_env(p, lane.env, ppb, 0, clip.left(), clip.right() + 1, y0, y1, ENV_COLOR, post.vol_mode,
-                         post.env_drag_pt(lane, "env"))
+            y0, y1 = self.env_y(i)
+            for kind, cv in sorted(CURVES.items(), key=lambda kv: kv[0] == post.curve):
+                pts, active = getattr(lane, cv["attr"]), kind == post.curve
+                if pts or active:
+                    draw_env(p, pts, ppb, 0, clip.left(), clip.right() + 1, y0, y1, cv["color"], active,
+                             post.env_drag_pt(lane, cv["attr"]), cv)
         x = post.playhead * ppb
         p.setPen(QPen(QColor("#ff5050"), 1.5))
         p.drawLine(QLineF(x, clip.top(), x, clip.bottom()))
@@ -379,7 +412,7 @@ class Canvas(QWidget):
         if post.vol_mode:
             lane, y0, y1 = self._lane_at(pos.y())
             if lane is not None:
-                post.env_press(lane, "env", pos.x() / post.ppb, pos.y(), y0, y1)
+                post.env_press(lane, post.cv()["attr"], pos.x() / post.ppb, pos.y(), y0, y1)
             return
         lane, r, edge = self._hit(pos)
         if r is not None:
@@ -407,7 +440,8 @@ class Canvas(QWidget):
             return
         if post.vol_mode:
             lane, y0, y1 = self._lane_at(pos.y())
-            hit = lane is not None and post.env_hit(lane.env, pos.x() / post.ppb, pos.y(), y0, y1) is not None
+            hit = lane is not None and post.env_hit(getattr(lane, post.cv()["attr"]), pos.x() / post.ppb,
+                                                    pos.y(), y0, y1) is not None
             self.setCursor(Qt.CursorShape.SizeVerCursor if hit else Qt.CursorShape.CrossCursor)
             return
         if self.drag is None:
@@ -454,7 +488,7 @@ class Canvas(QWidget):
         if post.vol_mode:
             lane, y0, y1 = self._lane_at(pos.y())
             if lane is not None:
-                post.env_delete_at(lane, "env", pos.x() / post.ppb, pos.y(), y0, y1)
+                post.env_delete_at(lane, post.cv()["attr"], pos.x() / post.ppb, pos.y(), y0, y1)
             return
         lane, r, _ = self._hit(pos)
         if lane is None:
@@ -477,8 +511,8 @@ class Canvas(QWidget):
         m = QMenu(self)
         if post.vol_mode:
             _, y0, y1 = self._lane_at(ev.pos().y())
-            post.env_menu_items(m, lane, "env", ev.pos().x() / post.ppb, ev.pos().y(), y0, y1,
-                                "Smazat křivku hlasitosti stopy")
+            post.env_menu_items(m, lane, post.cv()["attr"], ev.pos().x() / post.ppb, ev.pos().y(), y0, y1,
+                                f"Smazat křivku {post.cv()['what']} stopy")
             if not m.isEmpty():
                 m.exec(ev.globalPos())
             return
@@ -560,8 +594,10 @@ class LaneHeader(QFrame):
         a.setChecked(lane.fit)
         if lane.url:
             m.addAction("Otevřít na freesound.org", lambda: QDesktopServices.openUrl(QUrl(lane.url)))
-        if lane.env:
-            m.addAction("Smazat křivku hlasitosti", lambda: post.edit(lambda: setattr(lane, "env", [])))
+        for cv in CURVES.values():
+            if getattr(lane, cv["attr"]):
+                m.addAction(f"Smazat křivku {cv['what']}",
+                            lambda a=cv["attr"]: post.edit(lambda: setattr(lane, a, [])))
         m.addSeparator()
         m.addAction("Smazat stopu", lambda: post.edit(lambda: post.arr.lanes.remove(lane), rebuild=True))
         m.exec(self.mapToGlobal(pos))
@@ -603,7 +639,7 @@ class PostEditor(QWidget):
         self.playhead = 0.0
         self.sel: tuple[float, float] | None = None
         self.selected: list[Region] = []
-        self.vol_mode = False
+        self.curve: str | None = None     # kreslená křivka: vol / tame / gate (None = úpravy úseků)
         self.env_drag: dict | None = None
         self.player = ArrPlayer()
         self.compiled: Compiled | None = None
@@ -612,6 +648,9 @@ class PostEditor(QWidget):
         self._songs: dict[str, np.ndarray] = {}
         self._lp_key: dict = {}
         self.mix_peaks = None
+        self.mix_raw = None        # vlna mixu před úpravami (špičky, šum)
+        self._lane_fx: dict = {}   # poslední vypočtené úpravy – platí, než se spočítají nové
+        self._master_fx = None
         self._mix_gen = 0
         self.mix_pool = ThreadPoolExecutor(max_workers=1)
         self.sig = _Sig()
@@ -657,10 +696,14 @@ class PostEditor(QWidget):
         self.cut.clicked.connect(lambda: self.sel and self.edit(lambda: self.arr.delete_time(*self.sel), clear_sel=True))
         self.sil = mkbtn("Ztišit výběr", tip="Vypne všechny zvuky ve vybraném čase (čas zůstane)")
         self.sil.clicked.connect(lambda: self.sel and self.edit(lambda: self.arr.clear_range(*self.sel)))
-        self.volb = mkbtn("〰 Křivka hlasitosti", True, "vol",
-                          "Kreslení hlasitosti myší: klik = bod, táhni = hlasitěji/tišeji, dvojklik = smazat bod")
-        self.volb.toggled.connect(self.set_vol_mode)
-        self.volb.setMinimumWidth(self.volb.sizeHint().width() + 16)   # tučný text při zapnutí
+        self.curve_btns = {}
+        for kind, cv in CURVES.items():
+            b = mkbtn(f"〰 {cv['label']}", True, "vol", cv["tip"])
+            b.setStyleSheet(f"QPushButton:checked {{ background: {cv['color'].name()}; color: black; "
+                            f"font-weight: bold; }}")
+            b.toggled.connect(lambda on, k=kind: self.set_curve(k, on))
+            b.setMinimumWidth(b.sizeHint().width() + 16)   # tučný text při zapnutí
+            self.curve_btns[kind] = b
         self.undo_b = mkbtn("↶ Zpět", tip="Ctrl+Z")
         self.undo_b.clicked.connect(self.undo)
         self.redo_b = mkbtn("↷ Znovu", tip="Ctrl+Shift+Z")
@@ -677,7 +720,8 @@ class PostEditor(QWidget):
             tb.addWidget(w)
         root.addLayout(tb)
         tb2 = QHBoxLayout()
-        for w in (self.volb, add, ins, self.cut, self.sil):
+        tb2.addWidget(QLabel("Křivka:"))
+        for w in (*self.curve_btns.values(), add, ins, self.cut, self.sil):
             tb2.addWidget(w)
         tb2.addStretch(1)
         self.state_lbl = QLabel()
@@ -823,9 +867,11 @@ class PostEditor(QWidget):
                 continue
             regs = region_frames(lane, fpb)
             lanes.append(CompiledLane(lane.id, lane.ns, st, pan_gains(lane.volume, lane.pan), regs,
-                                      env_frames(lane.env, fpb)))
+                                      env_frames(lane.env, fpb), fx_pts(lane), self._lane_fx.get(lane.id)))
         end = max((rg[1] for cl in lanes for rg in cl.regions), default=0)
-        self.compiled = Compiled(self.engine.sr, self.arr.bpm, lanes, end, env_frames(self.arr.master_env, fpb))
+        # úpravy (špičky, šum) zůstanou z minula, než se v pozadí spočítají nové
+        self.compiled = Compiled(self.engine.sr, self.arr.bpm, lanes, end, env_frames(self.arr.master_env, fpb),
+                                 fx_pts(self.arr), self._master_fx)
         with self.engine.lock:
             self.player.compiled = self.compiled
         self.canvas.update_size()
@@ -838,12 +884,21 @@ class PostEditor(QWidget):
         gen, c = self._mix_gen, self.compiled
         bucket = max(1, int(self.fpb * MIX_BUCKET_BEATS))
         master = self.engine.master
-        self.mix_pool.submit(lambda: self.sig.mix.emit(gen, render_peaks(c, bucket, master)))
+        self.mix_pool.submit(lambda: self.sig.mix.emit(gen, analyze_mix(c, bucket, master)))
 
-    def _mix_done(self, gen, pk):
-        if gen == self._mix_gen:
-            self.mix_peaks = pk
-            self.top.update()
+    def _mix_done(self, gen, res):
+        raw, pk, lane_fx, master_fx = res
+        if gen != self._mix_gen:
+            return
+        self._lane_fx, self._master_fx = lane_fx, master_fx
+        c = self.compiled
+        with self.engine.lock:
+            for cl in c.lanes:
+                cl.fx = lane_fx.get(cl.lane_id)
+            c.fx = master_fx
+        self.mix_peaks = pk
+        self.mix_raw = raw if (lane_fx or master_fx is not None) else None
+        self.top.update()
 
     def lanes_changed(self):
         self.dirty = True
@@ -926,10 +981,25 @@ class PostEditor(QWidget):
             self.edit(lambda: setattr(r, "gain", v / 100))
 
     # ------------------------------------------------------------ hlasitost
-    def set_vol_mode(self, on: bool):
-        self.vol_mode = on
-        self.hint.setText(HINT_VOL if on else HINT)
-        self.hint.setStyleSheet(f"color: {'#ffd84a' if on else '#7b838c'}; font-size: 11px;")
+    @property
+    def vol_mode(self) -> bool:
+        """Kreslí se nějaká křivka (hlasitost / špičky / šum)."""
+        return self.curve is not None
+
+    def cv(self) -> dict:
+        return CURVES[self.curve or "vol"]
+
+    def set_curve(self, kind: str, on: bool):
+        if on:
+            self.curve = kind
+            for k, b in self.curve_btns.items():
+                if k != kind:
+                    set_checked(b, False)
+        elif self.curve == kind:
+            self.curve = None
+        on = self.curve is not None
+        self.hint.setText(self.cv()["hint"] if on else HINT)
+        self.hint.setStyleSheet(f"color: {self.cv()['color'].name() if on else '#7b838c'}; font-size: 11px;")
         self.selected = []
         self.canvas.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
         self.update_views()
@@ -937,7 +1007,7 @@ class PostEditor(QWidget):
     def env_hit(self, pts: list, beat: float, y: float, y0: float, y1: float) -> int | None:
         best, bd = None, 8.0
         for i, (pb, pv) in enumerate(pts):
-            d = max(abs(pb - beat) * self.ppb, abs(env_y(pv, y0, y1) - y))
+            d = max(abs(pb - beat) * self.ppb, abs(env_y(pv, y0, y1, self.cv()) - y))
             if d <= bd:
                 best, bd = i, d
         return best
@@ -947,7 +1017,7 @@ class PostEditor(QWidget):
         i = self.env_hit(pts, beat, y, y0, y1)
         self.begin_edit()
         if i is None:
-            pt = [self.snap_beat(beat), env_v(y, y0, y1)]
+            pt = [self.snap_beat(beat), env_v(y, y0, y1, self.cv())]
             pts.append(pt)
             pts.sort(key=lambda q: q[0])
         else:
@@ -962,7 +1032,7 @@ class PostEditor(QWidget):
         lo = pts[i - 1][0] if i > 0 else 0.0
         hi = pts[i + 1][0] if i + 1 < len(pts) else math.inf
         pt[0] = min(max(self.snap_beat(beat), lo), hi)
-        pt[1] = env_v(y, d["y0"], d["y1"])
+        pt[1] = env_v(y, d["y0"], d["y1"], self.cv())
         d["moved"] = True
         self.recompile(mix=False)
 
@@ -1139,9 +1209,9 @@ class PostEditor(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
 
     def do_export(self, out: Path, mix=True, stems=True, lanes=False) -> list[str]:
-        c = self.compiled
         out.mkdir(parents=True, exist_ok=True)
         master = self.engine.master
+        c = with_fx(self.compiled, master)   # úpravy (špičky, šum) přesně jako při přehrávání
         files = []
         if mix:
             render_to_file(c, out / "mix.wav", master=master)

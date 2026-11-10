@@ -22,6 +22,9 @@ QPushButton#solo:checked { background: #c9a227; color: black; }
 QPushButton#rec:checked  { background: #c62828; color: white; font-weight: bold; }
 QPushButton#play:checked { background: #1f8f45; color: white; font-weight: bold; }
 QPushButton#vol:checked  { background: #c9a227; color: black; font-weight: bold; }
+QPushButton#one:checked  { background: #2f7de1; color: white; font-weight: bold; }
+QPushButton#brk:checked  { background: #7b3fc4; color: white; font-weight: bold; }
+QPushButton[pending="true"] { border: 2px solid #f0c040; }   /* změna čeká na takt */
 QPushButton#big { font-size: 14px; font-weight: bold; padding: 6px 14px; }
 QFrame#column { background: #1e2023; border: 1px solid #33373c; border-radius: 6px; }
 QFrame#card { background: #1e2023; border: 1px solid #33373c; border-radius: 6px; }

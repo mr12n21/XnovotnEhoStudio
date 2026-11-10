@@ -32,6 +32,7 @@ sudo apt install -y python3 python3-venv python3-pip git libportaudio2 libxcb-cu
 cd ~
 git clone https://github.com/mr12n21/XNovotnEhoStudio.git
 cd XNovotnEhoStudio
+sudo chmod 755 ./run.sh 
 ```
 
 Bez gitu to jde i přes prohlížeč: na GitHubu klikni na **Code → Download ZIP**, ZIP rozbal
@@ -95,13 +96,30 @@ hned vidět, kde v taktu je.
 | **▶ Play** (mezerník) | spustí / zastaví přehrávání |
 | **BPM** | tempo, všechny smyčky se srovnají na takty |
 | **Na takt / Na dobu / Okamžitě** | kdy se zapnutí nebo vypnutí zvuku projeví |
-| **M / S** u kategorie | mute / solo kategorie |
+| **M / S** u kategorie | mute / solo kategorie, projeví se na takt (žlutý okraj = čeká na takt) |
+| **1×** u kategorie | z kategorie hraje jen jeden zvuk, zapnutí dalšího vypne předchozí |
 | **slider** u kategorie / zvuku | hlasitost |
 | **Náh.** | náhodně zapne 3 zvuky z kategorie |
 | **Vyp** | vypne celou kategorii |
 | **a1, a4, …** (délka) | délka smyčky v dobách: `auto`, `free` (přirozená délka), nebo pevně N dob |
 | **⇔ (fit)** | přetáhne zvuk přesně do tempa (mění výšku tónu jako gramofon). Zapíná se samo u zvuků s tempem v názvu („…128bpm“) |
 | **Vše vypnout** (Esc) | vypne všechno |
+
+### Minimalistika a kontrasty
+
+Když je toho moc najednou:
+
+- **max ∞** (vedle počítadla *hraje N*) nastaví, kolik zvuků smí hrát najednou. Když zapneš
+  další, nejstarší se na takt vypne. Snížení limitu mix rovnou proředí (vypne nejstarší).
+- **1×** u kategorie: jeden kick, jeden hat… nový zvuk vystřídá předchozí.
+- **Break** (klávesa **B**): na takt vypne všechno a zapamatuje si, co hrálo. Během breaku
+  můžeš pustit pár zvuků (pad, riser). **Drop** (B znovu) na takt vrátí původní mix.
+  Zvuky přidané během breaku zmizí. Na tlačítku se počítají takty breaku, takže je snadné
+  trefit 4, 8 nebo 16 taktů.
+- **M** u kategorie funguje jako částečný break, např. M na kicky = kick vypadne přesně na
+  takt, další M = vrátí se na takt.
+
+Zvuky, které jsou zapnuté, ale nejsou slyšet (mute / solo jiné kategorie), jsou tmavě zelené.
 
 Pravé tlačítko na zvuku: otevřít na freesound.org, panorama, kopírovat do jiné kategorie
 (vlastní výběry typu „kicks“), smazat.
@@ -131,7 +149,9 @@ Mezerník v této záložce přehrává časovou osu od červené čáry.
 | rozdělit, hlasitost úseku, duplikovat | pravé tlačítko na úsek |
 | výběr času | táhni v pravítku, pak **Vyjmout výběr** (čas zmizí, zbytek se posune) nebo **Ztišit výběr** |
 | pauza před drop | **Vložit takt** na pozici kurzoru (červená čára) |
-| **hlasitost v čase** (nájezd, vyjetí, ztišení části) | zapni **〰 Křivka hlasitosti**: klik do stopy = bod, táhni bod nahoru/dolů = hlasitěji/tišeji, dvojklik na bod = smazat. Nahoře v pásu MIX (oranžová čára) je hlasitost celku. Prostřední čárkovaná čára = 100 % |
+| **hlasitost v čase** (nájezd, vyjetí, ztišení části) | zapni **Křivka: 〰 Hlasitost**: klik do stopy = bod, táhni bod nahoru/dolů = hlasitěji/tišeji, dvojklik na bod = smazat. Nahoře v pásu MIX (oranžová čára) je hlasitost celku. Prostřední čárkovaná čára = 100 % |
+| **ztlumit špičky jen někde** (přehnaný drop, ostrá rána) | **Křivka: 〰 Špičky** (růžová): kreslí se stejně. Kde je křivka nahoře, ztlumí se místa výrazně hlasitější než běžná hlasitost stopy (v pásu MIX celého mixu). Dole = nechat. Tichá místa se nemění |
+| **odfiltrovat šum** (šum, brum, dozvuky mezi ranami) | **Křivka: 〰 Šum** (zelená): kde je křivka nahoře, ztlumí se tiché věci pod úrovní zvuku. Rány a hlasité části zůstanou. Čím výš, tím víc se odfiltruje (nahoře to umí useknout i dlouhé dozvuky) |
 | hlasitost / mute / solo stopy | vlevo u stopy (pravé tlačítko: délka smyčky, fit, smazat stopu) |
 | zoom | Ctrl + kolečko, posun: Shift + kolečko |
 | zpět / znovu | Ctrl+Z / Ctrl+Shift+Z |
@@ -141,7 +161,9 @@ Postprodukce nemusí začít nahrávkou. **+ Nová** vytvoří prázdnou časovo
 složit jen z vlastních písniček a zvuků. Vlastní soubory se kopírují do knihovny do
 kategorie `vlastni`, takže je najdeš i v záložce Mix.
 
-Křivky hlasitosti jsou navázané na čas, ne na úseky. Když posuneš úsek, křivka zůstane, kde
+Ve vlně MIX je tmavě červeně vidět, co špičky a šum ubraly. Platí pro přehrávání i export.
+
+Křivky (hlasitost, špičky, šum) jsou navázané na čas, ne na úseky. Když posuneš úsek, křivka zůstane, kde
 byla. *Vyjmout výběr* a *Vložit takt* je posouvají spolu s časem. Žlutá čára patří stopě,
 oranžová celému mixu. Vlny úseků i vlna mixu ukazují hlasitost už po úpravě.
 
@@ -149,6 +171,27 @@ Nic se neničí: výsledek se pokaždé znovu spočítá ze zdrojových zvuků. 
 (Ctrl+S, nebo samy při přepnutí nahrávky nebo zavření). **Export…** vytvoří mix, stopy
 po kategoriích (stems), případně každý zvuk zvlášť, a `CREDITS.txt`. Nahrávku vybereš
 nahoře v záložce. **Duplikovat** uloží kopii, takže jde zkoušet různé verze.
+
+## Experimentální: Vzorce (hudba podle matematiky)
+
+Volitelné rozšíření, ve výchozím stavu vypnuté. Zapíná se v menu **Nastavení → Experimentální
+vzorce** a přidá záložku **Vzorce**. Jde zapnout i proměnnou prostředí `NSS_EXPERIMENTAL=1`
+(`0` = vypnout). Je celé ve složce `studio/experimental/`. Když ji z buildu smažeš, aplikace
+funguje beze změny a položka v menu zmizí. Výsledky jsou obyčejné zvuky (kategorie `vzorce`) a
+obyčejné křivky v postprodukci, takže se s nimi dál pracuje jako se vším ostatním.
+
+| Podzáložka | Co dělá | Příklad vzorce |
+|---|---|---|
+| **Rytmus** | ze zvuku složí smyčku: vzorec určí, na kterých krocích zazní a jak hlasitě | `euklid(5, 16)`, `krok % 4 == 0`, `nahoda() < 0.3` |
+| **Zvuk** | vyrobí zvuk přímo ze vzorce (vlna v čase `t`, nebo bytebeat) | `sin(2*pi*55*t) * exp(-8*t)`, `t*(t >> 5 \| t >> 8)` |
+| **Křivka** | vyplní křivku hlasitosti, špiček nebo šumu v postprodukci (Ctrl+Z vrátí) | `0.5 + 0.5*sin(2*pi*t/8)`, `x**3` |
+| **Autopilot** | při přehrávání sám zapíná a vypíná zvuky v Mixu každých N taktů | `pravidlo(30)` (buněčný automat), `sin(takt/4 + i) > 0.3` |
+
+Každá podzáložka má nabídku **Příklady…** a pod vzorcem seznam proměnných. Ve vzorci jde jen
+matematika (`sin`, `exp`, `where`, `tri`, `saw`, `square`, `and/or/not`, `x if podmínka else y`,
+bitové operace…), nic jiného se nespustí. Vygenerovaný zvuk se stejným názvem se při dalším
+*Použít* přepíše, a když zrovna hraje, vymění se za běhu. Naposledy použité vzorce se pamatují
+(`experimental.json`).
 
 ## Data
 
@@ -159,6 +202,7 @@ library/<kategorie>/<id>_<název>.ogg
 exports/rec_*.wav                    nahrávky
 exports/rec_*.arr.json               časové osy (postprodukce)
 session.json                         otevřené kategorie, zapnuté zvuky, hlasitosti (obnoví se při startu)
+settings.json                        nastavení (zapnutí experimentálních vzorců)
 ```
 
 Do složky kategorie můžeš nakopírovat i vlastní WAV, FLAC nebo MP3 (nebo použít *Importovat soubory…*).
@@ -178,5 +222,6 @@ uvést autora a u **NC** se zvuk nesmí použít komerčně. Proto každý expor
 - `studio/arrangement.py` – časová osa: záznam, úpravy, render
 - `studio/audio_out.py` – výstup do zvukovky (PortAudio / Qt / null)
 - `studio/gui.py` – hlavní okno, `gui_mixer.py` – mix, `gui_timeline.py` – postprodukce
+- `studio/experimental/` – volitelné rozšíření Vzorce (`formula.py` vyhodnocení vzorců, `generators.py` rytmus/zvuk/křivka/autopilot, `panel.py` záložka)
 
 Proměnné prostředí: `NSS_HOME` (kde jsou `library/` a `exports/`), `NSS_BACKEND=auto|sd|qt|null`.

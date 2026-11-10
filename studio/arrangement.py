@@ -14,12 +14,22 @@ se posouvá s ním; při oříznutí zleva se upraví, aby zvuk zůstal na míst
 Křivka hlasitosti (Lane.env, Arrangement.master_env): body [doba, hlasitost]
 (1.0 = 100 %), mezi body se hlasitost plynule mění. Prázdná = všude 100 %.
 Je navázaná na čas (ne na úseky) – hodí se na nájezdy, vyjetí a ztišení části.
+
+Křivky úprav (Lane.tame_env / gate_env, Arrangement.tame_env / gate_env):
+body [doba, síla 0–1], prázdná = nic se nedělá. Kreslí se stejně jako hlasitost.
+  Špičky (tame) – místa výrazně hlasitější než běžná hlasitost stopy/mixu se
+                  ztlumí (kompresor s předstihem).
+  Šum (gate)    – tiché části pod úrovní zvuku (šum, brum, dozvuky mezi
+                  ranami) se ztlumí (noise gate s předstihem).
+Běžná hlasitost = medián špiček po dobách. Z toho vznikne křivka zisku
+(CompiledLane.fx, Compiled.fx) – počítá se v pozadí jednou pro celou nahrávku,
+takže přehrávání i export dají přesně stejný výsledek.
 """
 from __future__ import annotations
 
 import copy
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +45,11 @@ FADE_OUT = 176    # ~4 ms
 ENV_MAX = 2.0     # křivka hlasitosti max. 200 %
 ENV_EPS = 1 / 32  # doby – krátký přechod na hraně výběru (skok hlasitosti necvakne)
 
+FX_ATTRS = ("tame_env", "gate_env")   # křivky úprav (síla 0–1, prázdná = nic)
+FX_BLOCK = 512             # vzorků – rozlišení výpočtu úprav (~12 ms)
+TAME_RELEASE_DB_S = 30.0   # jak rychle se hlasitost po špičce vrací
+GATE_FALL_DB_S = 300.0     # jak rychle se šum po zvuku ztlumí (~100 ms, plynulé doznění)
+
 
 # =================================================================== křivka hlasitosti
 
@@ -44,9 +59,9 @@ def env_value(pts: list, beat: float) -> float:
     return float(np.interp(beat, [p[0] for p in pts], [p[1] for p in pts]))
 
 
-def env_simplify(pts: list) -> list:
-    """Seřadí body, vyhodí zbytečné (uprostřed rovného úseku); samé 100 % -> prázdná křivka."""
-    pts = sorted([float(b), min(ENV_MAX, max(0.0, float(v)))] for b, v in pts)
+def env_simplify(pts: list, neutral: float = 1.0, vmax: float = ENV_MAX) -> list:
+    """Seřadí body, vyhodí zbytečné (uprostřed rovného úseku); samá neutrální hodnota -> prázdná křivka."""
+    pts = sorted([float(b), min(vmax, max(0.0, float(v)))] for b, v in pts)
     out = []
     for i, p in enumerate(pts):
         if out and abs(out[-1][0] - p[0]) < 1e-9 and abs(out[-1][1] - p[1]) < 1e-6:
@@ -54,12 +69,12 @@ def env_simplify(pts: list) -> list:
         if 0 < i < len(pts) - 1 and abs(pts[i - 1][1] - p[1]) < 1e-6 and abs(pts[i + 1][1] - p[1]) < 1e-6:
             continue
         out.append(p)
-    if all(abs(v - 1.0) < 1e-6 for _, v in out):
+    if all(abs(v - neutral) < 1e-6 for _, v in out):
         return []
     return out
 
 
-def env_cut(pts: list, a: float, b: float) -> list:
+def env_cut(pts: list, a: float, b: float, neutral: float = 1.0, vmax: float = ENV_MAX) -> list:
     """Vyjmutí času [a, b) – body za výběrem se posunou doleva."""
     if not pts:
         return pts
@@ -67,17 +82,17 @@ def env_cut(pts: list, a: float, b: float) -> list:
     d = b - a
     out = [list(p) for p in pts if p[0] < a] + [[a, va], [a + ENV_EPS, vb]]
     out += [[p[0] - d, p[1]] for p in pts if p[0] > b + ENV_EPS]
-    return env_simplify(out)
+    return env_simplify(out, neutral, vmax)
 
 
-def env_insert(pts: list, at: float, beats: float) -> list:
+def env_insert(pts: list, at: float, beats: float, neutral: float = 1.0, vmax: float = ENV_MAX) -> list:
     """Vložení prázdného času – body za ním se posunou doprava."""
     if not pts:
         return pts
     v = env_value(pts, at)
     out = [list(p) for p in pts if p[0] < at] + [[at, v], [at + beats, v]]
     out += [[p[0] + beats, p[1]] for p in pts if p[0] > at]
-    return env_simplify(out)
+    return env_simplify(out, neutral, vmax)
 
 
 def env_frames(pts: list, fpb: float):
@@ -121,6 +136,8 @@ class Lane:
     song: bool = False       # vlastní zvuk/písnička – hraje celá (neořezává se na 2 min)
     regions: list[Region] = field(default_factory=list)
     env: list = field(default_factory=list)   # křivka hlasitosti [[doba, hlasitost], ...]
+    tame_env: list = field(default_factory=list)   # ztlumení špiček [[doba, síla 0–1], ...]
+    gate_env: list = field(default_factory=list)   # odfiltrování šumu [[doba, síla 0–1], ...]
 
     @property
     def path(self) -> Path:
@@ -141,6 +158,8 @@ class Arrangement:
     audio: str = ""     # původní nahrávka (WAV) – jen pro referenci
     name: str = ""
     master_env: list = field(default_factory=list)   # křivka hlasitosti celého mixu
+    tame_env: list = field(default_factory=list)     # ztlumení špiček celého mixu
+    gate_env: list = field(default_factory=list)     # odfiltrování šumu celého mixu
 
     # --------------------------------------------------------------- I/O
     def to_dict(self) -> dict:
@@ -152,13 +171,17 @@ class Arrangement:
         for ld in d.get("lanes", []):
             ld = dict(ld)
             regs = [Region(**r) for r in ld.pop("regions", [])]
-            ld["env"] = sorted([float(b), float(v)] for b, v in ld.get("env", []))
+            for k in ("env",) + FX_ATTRS:
+                ld[k] = sorted([float(b), float(v)] for b, v in ld.get(k, []))
             if ld.get("length") not in LENGTH_OPTIONS:
                 ld["length"] = "auto"
             lanes.append(Lane(**ld, regions=regs))
         return Arrangement(bpm=float(d.get("bpm", 130)), lanes=lanes,
                            audio=d.get("audio", ""), name=d.get("name", ""),
-                           master_env=sorted([float(b), float(v)] for b, v in d.get("master_env", [])))
+                           master_env=sorted([float(b), float(v)] for b, v in d.get("master_env", [])),
+                           tame_env=sorted([float(b), float(v)] for b, v in d.get("tame_env", []))
+                           or ([[0.0, min(3, int(d["tame"])) / 3]] if d.get("tame") else []),  # starší verze
+                           gate_env=sorted([float(b), float(v)] for b, v in d.get("gate_env", [])))
 
     def save(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,17 +223,25 @@ class Arrangement:
         d = b - a
         for l in self.lanes:
             l.env = env_cut(l.env, a, b)
+            for k in FX_ATTRS:
+                setattr(l, k, env_cut(getattr(l, k), a, b, 0.0, 1.0))
             for r in l.regions:
                 if r.start >= b:
                     r.start -= d
                     r.end -= d
         self.master_env = env_cut(self.master_env, a, b)
+        for k in FX_ATTRS:
+            setattr(self, k, env_cut(getattr(self, k), a, b, 0.0, 1.0))
 
     def insert_time(self, at: float, beats: float):
         """Vloží prázdný čas (pauza před drop)."""
         self.master_env = env_insert(self.master_env, at, beats)
+        for k in FX_ATTRS:
+            setattr(self, k, env_insert(getattr(self, k), at, beats, 0.0, 1.0))
         for l in self.lanes:
             l.env = env_insert(l.env, at, beats)
+            for k in FX_ATTRS:
+                setattr(l, k, env_insert(getattr(l, k), at, beats, 0.0, 1.0))
             new = []
             for r in l.regions:
                 if r.start >= at:
@@ -318,6 +349,8 @@ class CompiledLane:
     gains: np.ndarray
     regions: list[tuple]   # start, end, origin, gain, fade_in, fade_out (vzorky)
     env: tuple | None = None   # křivka hlasitosti stopy (env_frames)
+    fx_pts: tuple = ([], [])   # křivky úprav stopy v dobách (tame_env, gate_env)
+    fx: tuple | None = None    # vypočtená křivka zisku z úprav (vzorky, zisk)
 
 
 @dataclass
@@ -327,6 +360,8 @@ class Compiled:
     lanes: list[CompiledLane]
     end: int
     master_env: tuple | None = None
+    fx_pts: tuple = ([], [])   # křivky úprav celého mixu v dobách
+    fx: tuple | None = None    # vypočtená křivka zisku celého mixu
 
 
 def compile_arr(arr: Arrangement, buffers: dict, sr: int = config.SAMPLE_RATE, loader=None) -> Compiled:
@@ -345,9 +380,13 @@ def compile_arr(arr: Arrangement, buffers: dict, sr: int = config.SAMPLE_RATE, l
         st = prepare_state(buf, sr, arr.bpm, lane.length, lane.fit, bpm_from_title(lane.title))
         regs = region_frames(lane, fpb)
         out.append(CompiledLane(lane.id, lane.ns, st, pan_gains(lane.volume, lane.pan), regs,
-                                env_frames(lane.env, fpb)))
+                                env_frames(lane.env, fpb), fx_pts(lane)))
     end = max((rg[1] for cl in out for rg in cl.regions), default=0)
-    return Compiled(sr, arr.bpm, out, end, env_frames(arr.master_env, fpb))
+    return Compiled(sr, arr.bpm, out, end, env_frames(arr.master_env, fpb), fx_pts(arr))
+
+
+def fx_pts(owner) -> tuple:
+    return tuple([list(p) for p in getattr(owner, k)] for k in FX_ATTRS)
 
 
 def region_frames(lane: Lane, fpb: float) -> list[tuple]:
@@ -375,7 +414,7 @@ def render_into(c: Compiled, out: np.ndarray, s: int, lane_ids: set[str] | None 
             if b > re_ - fo:
                 k0 = max(a, re_ - fo)
                 env[k0 - a:, 0] *= (re_ - np.arange(k0, b)) / fo
-            for ce in (cl.env, c.master_env):
+            for ce in (cl.env, c.master_env, cl.fx, c.fx):
                 if ce is not None:
                     env[:, 0] *= np.interp(np.arange(a, b, dtype=np.float64), ce[0], ce[1]).astype(np.float32)
             pos = np.arange(a - origin, b - origin, dtype=np.int64)
@@ -413,6 +452,118 @@ def render_peaks(c: Compiled, bucket: int, master: float = 0.8, chunk: int = 1 <
         mono = np.pad(mono, (0, k * bucket - len(mono)))
         peaks[s // bucket:s // bucket + k] = mono.reshape(k, bucket).max(axis=1)
     return np.sqrt(np.clip(peaks, 0, 1))
+
+
+def _amount(pts: list, n: int, fpb: float):
+    """Síla úpravy pro každý blok (None = nikde nic)."""
+    if not pts or max(v for _, v in pts) <= 0.005:
+        return None
+    beats = (np.arange(n, dtype=np.float64) + 0.5) * FX_BLOCK / fpb
+    return np.clip(np.interp(beats, [q[0] for q in pts], [q[1] for q in pts]), 0.0, 1.0)
+
+
+def fx_curve(levels: np.ndarray, pts: tuple, sr: int, fpb: float):
+    """Křivka zisku z úrovní bloků (FX_BLOCK) a křivek úprav. None = nic se nemění."""
+    n = len(levels)
+    tame, gate = (_amount(q, n, fpb) for q in pts)
+    if n == 0 or (tame is None and gate is None):
+        return None
+    # běžná hlasitost = medián špiček po dobách (ticho se nepočítá)
+    k = max(1, int(round(fpb / FX_BLOCK)))
+    m = -(-n // k)
+    beats = np.pad(levels, (0, m * k - n)).reshape(m, k).max(axis=1)
+    active = beats[beats > max(1e-4, beats.max() * 0.05)]
+    if not active.size:
+        return None
+    typ_db = 20 * np.log10(float(np.median(active)))
+    # předstih: blok se upraví už podle špičky v sousedním bloku
+    pad = np.pad(levels, 1)
+    env = np.maximum(np.maximum(pad[:-2], pad[1:-1]), pad[2:])
+    lvl_db = 20 * np.log10(np.maximum(env, 1e-9))
+    g_db = np.zeros(n)
+    if tame is not None:
+        # síla 1/3 ≈ jemně (práh +4 dB, 2:1), 2/3 ≈ středně (+2 dB, 4:1), 1 = silně (0 dB, 20:1)
+        thr = typ_db + 6.0 * (1 - tame)
+        target = -np.maximum(lvl_db - thr, 0.0) * 0.95 * tame ** 0.6
+        rel = TAME_RELEASE_DB_S * FX_BLOCK / sr
+        out, prev = np.empty(n), 0.0
+        for i, v in enumerate(target.tolist()):     # ztlumení hned, návrat pomalu
+            prev = v if v < prev + rel else prev + rel
+            out[i] = prev
+        g_db += out
+    if gate is not None:
+        # práh pod běžnou hlasitostí: síla 0 -> -40 dB, 1 -> -12 dB; hloubka až -60 dB
+        thr = typ_db - 40.0 + 28.0 * gate
+        target = -np.minimum((thr - lvl_db).clip(0.0) * 3.0, 60.0 * gate)
+        fall = GATE_FALL_DB_S * FX_BLOCK / sr
+        out, prev = np.empty(n), 0.0
+        for i, v in enumerate(target.tolist()):     # otevření hned, zavření plynule
+            prev = v if v > prev - fall else prev - fall
+            out[i] = prev
+        g_db += out
+    if g_db.min() > -0.05:
+        return None
+    frames = (np.arange(n, dtype=np.float64) + 0.5) * FX_BLOCK
+    return frames, 10 ** (g_db / 20)
+
+
+def _has_fx(pts: tuple) -> bool:
+    return any(q and max(v for _, v in q) > 0.005 for q in pts)
+
+
+def _scan(c: Compiled, bucket: int, master: float, lane_ids=None, chunk: int = 1 << 16):
+    """Projde mix: špičky po sloupcích vlny (bucket) a po blocích FX_BLOCK (před limiterem)."""
+    total = c.end
+    bpk = np.zeros(max(1, -(-total // bucket)), np.float32)
+    levels = np.zeros(max(1, -(-total // FX_BLOCK)), np.float32)
+    for s in range(0, total, chunk):
+        n = min(chunk, total - s)
+        out = np.zeros((n, 2), np.float32)
+        render_into(c, out, s, lane_ids)
+        mono = np.abs(out).max(axis=1) * master
+        for size, arr in ((bucket, bpk), (FX_BLOCK, levels)):
+            first = s // size
+            starts = np.unique(np.concatenate([[0], np.arange(-s % size, n, size)]))
+            vals = np.maximum.reduceat(mono, starts)
+            arr[first:first + len(vals)] = np.maximum(arr[first:first + len(vals)], vals)
+    return bpk, levels
+
+
+def _disp(x: np.ndarray) -> np.ndarray:
+    return np.sqrt(np.clip(soft_clip(x.astype(np.float32)), 0, 1))
+
+
+def analyze_mix(c: Compiled, bucket: int, master: float = 0.8):
+    """Spočítá úpravy (špičky, šum) stop i mixu a vlnu mixu před a po nich.
+    Vrací (vlna před, vlna po, {lane_id: křivka zisku}, křivka zisku mixu)."""
+    fpb = c.sr * 60.0 / c.bpm
+    base = replace(c, fx=None, lanes=[replace(cl, fx=None) for cl in c.lanes])
+    raw, raw_lv = _scan(base, bucket, master)
+    lane_fx = {}
+    solo = replace(base, master_env=None)
+    for cl in base.lanes:
+        if _has_fx(cl.fx_pts):
+            _, lv = _scan(solo, bucket, 1.0, {cl.lane_id})
+            curve = fx_curve(lv, cl.fx_pts, c.sr, fpb)
+            if curve is not None:
+                lane_fx[cl.lane_id] = curve
+    mid = replace(base, lanes=[replace(cl, fx=lane_fx.get(cl.lane_id)) for cl in base.lanes])
+    master_fx = None
+    if _has_fx(c.fx_pts):
+        lv = _scan(mid, bucket, master)[1] if lane_fx else raw_lv
+        master_fx = fx_curve(lv, c.fx_pts, c.sr, fpb)
+    if not lane_fx and master_fx is None:
+        p = _disp(raw)
+        return p, p, lane_fx, None
+    pk, _ = _scan(replace(mid, fx=master_fx), bucket, master)
+    return _disp(raw), _disp(pk), lane_fx, master_fx
+
+
+def with_fx(c: Compiled, master: float = 0.8) -> Compiled:
+    """Compiled s vypočtenými úpravami (pro export)."""
+    bucket = max(1, int(c.sr * 60.0 / c.bpm / 16))
+    _, _, lane_fx, master_fx = analyze_mix(c, bucket, master)
+    return replace(c, fx=master_fx, lanes=[replace(cl, fx=lane_fx.get(cl.lane_id)) for cl in c.lanes])
 
 
 class ArrPlayer:
